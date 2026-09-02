@@ -56,9 +56,29 @@ def test_workspace_command_explains_how_to_select_audio_directory(tmp_path: Path
     assert "callforge init /path/to/audio" in capsys.readouterr().err
 
 
-def test_only_init_and_scan_accept_a_directory_argument():
+def test_only_commands_that_need_a_scope_accept_a_directory_argument():
     parser = cli.build_parser()
     assert parser.parse_args(["init", "/audio"]).directory == "/audio"
     assert parser.parse_args(["scan", "/audio"]).directory == "/audio"
+    assert parser.parse_args(["reset", "/audio/archive"]).directory == "/audio/archive"
     for command in ("run", "ui", "status", "retry", "transcripts", "workspace"):
         assert not hasattr(parser.parse_args([command]), "directory")
+
+
+def test_reset_command_uses_active_workspace_and_requires_confirmation(tmp_path: Path, monkeypatch, capsys):
+    audio_root = tmp_path / "audio"
+    audio_root.mkdir()
+    audio = audio_root / "external-201-123-20260419-193423-id.mp3"
+    audio.write_bytes(b"audio")
+    monkeypatch.setenv("CALLFORGE_HOME", str(tmp_path / "state"))
+    assert cli.main(["init", str(audio_root)]) == 0
+
+    monkeypatch.setattr("builtins.input", lambda _: "cancel")
+    assert cli.main(["reset"]) == 1
+    _, database = cli.workspace()
+    assert database.reset_count() == 1
+
+    assert cli.main(["reset", "--yes"]) == 0
+    assert database.reset_count() == 0
+    assert audio.is_file()
+    assert "Source files were not changed" in capsys.readouterr().out

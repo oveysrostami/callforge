@@ -12,6 +12,13 @@ from typing import Iterator
 from callforge.metadata import AudioMetadata
 
 
+MIN_PROCESSABLE_DURATION_SECONDS = 0.5
+
+
+def is_zero_duration(duration_seconds: float | None) -> bool:
+    return duration_seconds is not None and duration_seconds < MIN_PROCESSABLE_DURATION_SECONDS
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS audio_files (
     id INTEGER PRIMARY KEY,
@@ -40,7 +47,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     audio_file_id INTEGER NOT NULL REFERENCES audio_files(id) ON DELETE CASCADE,
     stage TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed', 'skipped')),
     priority INTEGER NOT NULL DEFAULT 0,
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 3,
@@ -102,7 +109,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(stage, status, priority DESC, id);
 CREATE INDEX IF NOT EXISTS idx_transcripts_current ON transcripts(audio_file_id, is_current);
 CREATE INDEX IF NOT EXISTS idx_runs_audio ON processing_runs(audio_file_id, started_at);
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 """
 
 MIGRATION_1_TO_2 = """
@@ -164,6 +171,51 @@ PRAGMA foreign_keys = ON;
 PRAGMA user_version = 3;
 """
 
+MIGRATION_3_TO_4 = """
+PRAGMA foreign_keys = OFF;
+CREATE TABLE jobs_v4 (
+    id INTEGER PRIMARY KEY,
+    audio_file_id INTEGER NOT NULL REFERENCES audio_files(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed', 'skipped')),
+    priority INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    lease_expires_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(audio_file_id, stage)
+);
+INSERT INTO jobs_v4 (
+    id, audio_file_id, stage, status, priority, attempts, max_attempts,
+    claimed_by, claimed_at, lease_expires_at, last_error, created_at, updated_at
+)
+SELECT
+    j.id, j.audio_file_id, j.stage,
+    CASE
+        WHEN j.status != 'running'
+         AND a.duration_seconds IS NOT NULL
+         AND a.duration_seconds < 0.5 THEN 'skipped'
+        ELSE j.status
+    END,
+    CASE
+        WHEN a.duration_seconds IS NOT NULL AND a.duration_seconds < 0.5 THEN 0
+        ELSE j.priority
+    END,
+    j.attempts, j.max_attempts, j.claimed_by, j.claimed_at, j.lease_expires_at,
+    j.last_error, j.created_at, j.updated_at
+FROM jobs j
+JOIN audio_files a ON a.id = j.audio_file_id;
+DROP TABLE jobs;
+ALTER TABLE jobs_v4 RENAME TO jobs;
+CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(stage, status, priority DESC, id);
+PRAGMA foreign_keys = ON;
+PRAGMA user_version = 4;
+"""
+
 
 def utcnow() -> str:
     return datetime.now(UTC).isoformat()
@@ -185,7 +237,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > 3:
+            if version > 4:
                 raise RuntimeError(
                     f"Database schema {version} is newer than this CallForge supports"
                 )
@@ -197,6 +249,9 @@ class Database:
                 version = 2
             if version == 2:
                 connection.executescript(MIGRATION_2_TO_3)
+                version = 3
+            if version == 3:
+                connection.executescript(MIGRATION_3_TO_4)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -216,6 +271,7 @@ class Database:
     ) -> tuple[int, bool, bool]:
         values = asdict(metadata)
         now = utcnow()
+        desired_status = "skipped" if is_zero_duration(metadata.duration_seconds) else "pending"
         with self.transaction() as connection:
             previous = connection.execute(
                 "SELECT id, content_sha256, size_bytes, mtime_ns FROM audio_files WHERE absolute_path = ?",
@@ -238,8 +294,8 @@ class Database:
             )
             connection.execute(
                 "INSERT INTO jobs (audio_file_id, stage, status, max_attempts, created_at, updated_at) "
-                "VALUES (?, 'transcribe', 'pending', ?, ?, ?) ON CONFLICT(audio_file_id, stage) DO NOTHING",
-                (audio_id, max_attempts, now, now),
+                "VALUES (?, 'transcribe', ?, ?, ?, ?) ON CONFLICT(audio_file_id, stage) DO NOTHING",
+                (audio_id, desired_status, max_attempts, now, now),
             )
             if changed and previous is not None:
                 connection.execute(
@@ -247,9 +303,22 @@ class Database:
                     (audio_id,),
                 )
                 connection.execute(
-                    "UPDATE jobs SET status='pending', attempts=0, claimed_by=NULL, claimed_at=NULL, "
+                    "UPDATE jobs SET status=?, priority=0, attempts=0, claimed_by=NULL, claimed_at=NULL, "
                     "lease_expires_at=NULL, last_error=NULL, updated_at=? "
                     "WHERE audio_file_id=? AND stage='transcribe' AND status != 'running'",
+                    (desired_status, now, audio_id),
+                )
+            elif desired_status == "skipped":
+                connection.execute(
+                    "UPDATE jobs SET status='skipped', priority=0, claimed_by=NULL, claimed_at=NULL, "
+                    "lease_expires_at=NULL, last_error=NULL, updated_at=? "
+                    "WHERE audio_file_id=? AND stage='transcribe' AND status != 'running'",
+                    (now, audio_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE jobs SET status='pending', priority=0, attempts=0, last_error=NULL, updated_at=? "
+                    "WHERE audio_file_id=? AND stage='transcribe' AND status='skipped'",
                     (now, audio_id),
                 )
             return audio_id, changed, created
@@ -259,6 +328,12 @@ class Database:
         if not content.strip():
             return None
         with self.transaction() as connection:
+            job = connection.execute(
+                "SELECT status FROM jobs WHERE audio_file_id=? AND stage='transcribe'",
+                (audio_id,),
+            ).fetchone()
+            if job is not None and job["status"] == "skipped":
+                return None
             transcript_id, inserted = self._store_transcript(
                 connection, audio_id, None, content, path, language, "existing_markdown"
             )
@@ -347,6 +422,7 @@ class Database:
                 "SELECT j.*, a.absolute_path, a.filename FROM jobs j "
                 "JOIN audio_files a ON a.id=j.audio_file_id "
                 "WHERE j.stage='transcribe' AND j.status='pending' AND j.attempts < j.max_attempts "
+                "AND (a.duration_seconds IS NULL OR a.duration_seconds >= 0.5) "
                 "ORDER BY j.priority DESC, j.id LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -370,15 +446,23 @@ class Database:
     def queue_transcription(self, audio_id: int) -> str | None:
         """Queue one exact file from an interactive request.
 
-        Returns ``queued``, ``running``, or ``None`` when the audio id does not exist.
+        Returns ``queued``, ``running``, ``skipped``, or ``None`` when the audio id does not exist.
         """
         now = utcnow()
         with self.transaction() as connection:
             audio = connection.execute(
-                "SELECT id FROM audio_files WHERE id=?", (audio_id,)
+                "SELECT id, duration_seconds FROM audio_files WHERE id=?", (audio_id,)
             ).fetchone()
             if audio is None:
                 return None
+            if is_zero_duration(audio["duration_seconds"]):
+                connection.execute(
+                    "UPDATE jobs SET status='skipped', priority=0, claimed_by=NULL, claimed_at=NULL, "
+                    "lease_expires_at=NULL, last_error=NULL, updated_at=? "
+                    "WHERE audio_file_id=? AND stage='transcribe' AND status != 'running'",
+                    (now, audio_id),
+                )
+                return "skipped"
             job = connection.execute(
                 "SELECT id, status FROM jobs WHERE audio_file_id=? AND stage='transcribe'",
                 (audio_id,),
@@ -417,6 +501,7 @@ class Database:
                 "SELECT j.*, a.absolute_path, a.filename FROM jobs j "
                 "JOIN audio_files a ON a.id=j.audio_file_id "
                 "WHERE j.audio_file_id=? AND j.stage='transcribe' AND j.status='pending' "
+                "AND (a.duration_seconds IS NULL OR a.duration_seconds >= 0.5) "
                 "AND j.attempts < j.max_attempts",
                 (audio_id,),
             ).fetchone()
@@ -507,14 +592,73 @@ class Database:
                 (utcnow(),),
             ).rowcount
 
+    @staticmethod
+    def _audio_rows_in_scope(
+        connection: sqlite3.Connection, directory: Path | None
+    ) -> list[sqlite3.Row]:
+        rows = connection.execute(
+            "SELECT a.id, a.absolute_path, j.status AS job_status "
+            "FROM audio_files a LEFT JOIN jobs j "
+            "ON j.audio_file_id=a.id AND j.stage='transcribe'"
+        ).fetchall()
+        if directory is None:
+            return list(rows)
+        target = directory.expanduser().resolve()
+        selected: list[sqlite3.Row] = []
+        for row in rows:
+            audio_path = Path(row["absolute_path"]).expanduser().resolve()
+            if audio_path == target or target in audio_path.parents:
+                selected.append(row)
+        return selected
+
+    def reset_count(self, directory: Path | None = None) -> int:
+        with self.connect() as connection:
+            return len(self._audio_rows_in_scope(connection, directory))
+
+    def reset(self, directory: Path | None = None) -> int:
+        """Delete indexed database records without touching source or Markdown files."""
+
+        with self.transaction() as connection:
+            rows = self._audio_rows_in_scope(connection, directory)
+            running = [row for row in rows if row["job_status"] == "running"]
+            if running:
+                raise RuntimeError(
+                    f"Cannot reset {len(running)} actively processing file(s). "
+                    "Stop the active run or UI worker and try again."
+                )
+            connection.executemany(
+                "DELETE FROM audio_files WHERE id=?",
+                ((row["id"],) for row in rows),
+            )
+            return len(rows)
+
     def counts(self) -> dict[str, int]:
         with self.connect() as connection:
-            result = {"audio_files": int(connection.execute("SELECT COUNT(*) FROM audio_files").fetchone()[0])}
+            result = {
+                "total_audio_files": int(
+                    connection.execute("SELECT COUNT(*) FROM audio_files").fetchone()[0]
+                ),
+                "audio_files": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM audio_files a LEFT JOIN jobs j "
+                        "ON j.audio_file_id=a.id AND j.stage='transcribe' "
+                        "WHERE j.status IS NULL OR j.status != 'skipped'"
+                    ).fetchone()[0]
+                ),
+            }
             for row in connection.execute("SELECT status, COUNT(*) AS count FROM jobs GROUP BY status"):
                 result[str(row["status"])] = int(row["count"])
-            result["transcripts"] = int(connection.execute("SELECT COUNT(*) FROM transcripts").fetchone()[0])
+            eligible_transcripts = (
+                "FROM transcripts t JOIN jobs j ON j.audio_file_id=t.audio_file_id "
+                "AND j.stage='transcribe' WHERE j.status != 'skipped'"
+            )
+            result["transcripts"] = int(
+                connection.execute(f"SELECT COUNT(*) {eligible_transcripts}").fetchone()[0]
+            )
             result["current_transcripts"] = int(
-                connection.execute("SELECT COUNT(*) FROM transcripts WHERE is_current=1").fetchone()[0]
+                connection.execute(
+                    f"SELECT COUNT(*) {eligible_transcripts} AND t.is_current=1"
+                ).fetchone()[0]
             )
             return result
 
@@ -523,7 +667,9 @@ class Database:
             return connection.execute(
                 "SELECT a.relative_path, t.version, t.source, t.markdown_path, t.created_at "
                 "FROM transcripts t JOIN audio_files a ON a.id=t.audio_file_id "
-                "WHERE t.is_current=1 ORDER BY t.created_at DESC LIMIT ?",
+                "JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' "
+                "WHERE t.is_current=1 AND j.status != 'skipped' "
+                "ORDER BY t.created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
 
@@ -551,7 +697,7 @@ class Database:
         if direction in {"inbound", "outbound", "internal"}:
             conditions.append("a.direction = ?")
             parameters.append(direction)
-        if status in {"pending", "running", "completed", "failed"}:
+        if status in {"pending", "running", "completed", "failed", "skipped"}:
             conditions.append("j.status = ?")
             parameters.append(status)
         if transcript == "yes":
@@ -563,6 +709,7 @@ class Database:
             "FROM audio_files a "
             "LEFT JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' "
             "LEFT JOIN transcripts t ON t.audio_file_id=a.id AND t.is_current=1 "
+            "AND (j.status IS NULL OR j.status != 'skipped') "
         )
         with self.connect() as connection:
             total = int(
@@ -593,6 +740,7 @@ class Database:
                 "FROM audio_files a "
                 "LEFT JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' "
                 "LEFT JOIN transcripts t ON t.audio_file_id=a.id AND t.is_current=1 "
+                "AND (j.status IS NULL OR j.status != 'skipped') "
                 "WHERE a.id=?",
                 (audio_id,),
             ).fetchone()

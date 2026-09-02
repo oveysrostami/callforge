@@ -45,7 +45,8 @@ def command_init(args) -> int:
     print(f"Initialized {config.workspace}")
     print(f"Active audio directory: {config.root}")
     print(
-        f"Indexed {result.discovered} MP3 files; {result.imported_markdown} existing Markdown transcripts imported."
+        f"Indexed {result.discovered} MP3 files; skipped_zero_duration={result.skipped}; "
+        f"{result.imported_markdown} existing Markdown transcripts imported."
     )
     return 0
 
@@ -57,7 +58,8 @@ def command_scan(args) -> int:
     print(f"Active audio directory: {config.root}")
     print(
         f"Indexed {result.discovered} MP3 files; changed={result.changed}, "
-        f"metadata_errors={result.metadata_errors}, imported_markdown={result.imported_markdown}."
+        f"metadata_errors={result.metadata_errors}, skipped_zero_duration={result.skipped}, "
+        f"imported_markdown={result.imported_markdown}."
     )
     return 0
 
@@ -83,7 +85,10 @@ def command_run(args) -> int:
 def command_status(args) -> int:
     _, database = workspace()
     values = database.counts()
-    for key in ("audio_files", "pending", "running", "completed", "failed", "transcripts", "current_transcripts"):
+    for key in (
+        "total_audio_files", "audio_files", "skipped", "pending", "running",
+        "completed", "failed", "transcripts", "current_transcripts",
+    ):
         print(f"{key}: {values.get(key, 0)}")
     return 0
 
@@ -98,6 +103,40 @@ def command_workspace(args) -> int:
 def command_retry(args) -> int:
     _, database = workspace()
     print(f"Requeued {database.retry_failed()} failed jobs.")
+    return 0
+
+
+def command_reset(args) -> int:
+    config, database = workspace()
+    target: Path | None = None
+    if args.directory:
+        supplied = Path(args.directory).expanduser()
+        target = (supplied if supplied.is_absolute() else config.root / supplied).resolve()
+        root = config.root.resolve()
+        if target != root and root not in target.parents:
+            raise ValueError(f"Reset directory must be inside the active audio directory: {root}")
+        if target.exists() and not target.is_dir():
+            raise ValueError(f"Reset target is not a directory: {target}")
+        if target == root:
+            target = None
+    count = database.reset_count(target)
+    if count == 0:
+        print("No matching database records found. Source files were not changed.")
+        return 0
+    scope = f"under {target}" if target is not None else "from the active workspace"
+    if not args.yes:
+        answer = input(
+            f"Delete {count} audio record(s) and all related database data {scope}? "
+            "Source MP3/Markdown files will remain. Type RESET to continue: "
+        )
+        if answer.strip() != "RESET":
+            print("Reset cancelled.")
+            return 1
+    deleted = database.reset(target)
+    print(
+        f"Deleted {deleted} audio record(s) and their related jobs, runs, transcripts, "
+        "and artifacts. Source files were not changed."
+    )
     return 0
 
 
@@ -164,6 +203,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     retry = subparsers.add_parser("retry", help="Requeue terminal failures")
     retry.set_defaults(func=command_retry)
+
+    reset = subparsers.add_parser("reset", help="Delete indexed database data without deleting source files")
+    reset.add_argument("directory", nargs="?", help="Optional directory inside the active audio root")
+    reset.add_argument("--yes", action="store_true", help="Skip the RESET confirmation prompt")
+    reset.set_defaults(func=command_reset)
 
     transcripts = subparsers.add_parser("transcripts", help="List current transcripts")
     transcripts.add_argument("--limit", type=positive_int, default=20)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from callforge.config import AppConfig, WORKSPACE_NAME
-from callforge.db import Database
+from callforge.db import Database, is_zero_duration
 from callforge.metadata import extract_audio_metadata
 
 
@@ -14,6 +14,7 @@ class ScanResult:
     changed: int = 0
     metadata_errors: int = 0
     imported_markdown: int = 0
+    skipped: int = 0
 
 
 def discover_mp3(root: Path):
@@ -32,8 +33,14 @@ def scan(config: AppConfig, database: Database, import_markdown: bool = True) ->
         result.discovered += 1
         result.changed += int(changed)
         result.metadata_errors += int(metadata.metadata_error is not None)
+        result.skipped += int(is_zero_duration(metadata.duration_seconds))
         markdown = path.with_suffix(".md")
-        if import_markdown and markdown.is_file() and not (changed and not created):
+        if (
+            import_markdown
+            and not is_zero_duration(metadata.duration_seconds)
+            and markdown.is_file()
+            and not (changed and not created)
+        ):
             result.imported_markdown += int(
                 database.import_markdown(audio_id, markdown, config.language) is not None
             )

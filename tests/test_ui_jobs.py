@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 from callforge.codex_runner import CodexResult
@@ -75,3 +76,23 @@ def test_ui_service_retries_until_terminal_failure(tmp_path: Path):
         service.shutdown(wait=True)
     assert runner.calls == 3
     assert database.audio_file_detail(audio_id)["job_status"] == "failed"
+
+
+def test_ui_service_never_submits_zero_duration_audio(tmp_path: Path):
+    audio = tmp_path / "external-201-123-20260408-143250-zero.mp3"
+    audio.write_bytes(b"header only")
+    config = AppConfig.for_root(tmp_path)
+    config.ensure()
+    database = Database(config.database)
+    database.initialize()
+    metadata = replace(extract_audio_metadata(audio, tmp_path), duration_seconds=0.144)
+    audio_id, _, _ = database.upsert_audio(metadata)
+    runner = FailingRunner()
+    service = UITranscriptionService(config, database, runner=runner)
+    try:
+        assert service.request(audio_id) == "skipped"
+        assert service.wait(audio_id) is None
+    finally:
+        service.shutdown(wait=True)
+    assert runner.calls == 0
+    assert database.audio_file_detail(audio_id)["job_status"] == "skipped"

@@ -19,7 +19,7 @@
 
     <main>
       <section class="stats" aria-label="خلاصه وضعیت">
-        <article><span>فایل صوتی</span><strong id="stat-files">—</strong></article>
+        <article><span>قابل پردازش</span><strong id="stat-files">—</strong></article>
         <article><span>متن آماده</span><strong id="stat-transcripts">—</strong></article>
         <article><span>در انتظار</span><strong id="stat-pending">—</strong></article>
         <article><span>ناموفق</span><strong id="stat-failed">—</strong></article>
@@ -50,6 +50,7 @@
                 <option value="pending">در انتظار</option>
                 <option value="running">در حال پردازش</option>
                 <option value="failed">ناموفق</option>
+                <option value="skipped">مدت صفر</option>
               </select>
             </label>
             <label>
@@ -130,7 +131,7 @@
                 </div>
                 <span id="transcript-version"></span>
               </div>
-              <pre id="transcript"></pre>
+              <article class="markdown-body" id="transcript" dir="rtl"></article>
               <div class="no-transcript hidden" id="no-transcript">هنوز متنی برای این فایل ثبت نشده است.</div>
             </section>
           </div>

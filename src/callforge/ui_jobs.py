@@ -29,7 +29,7 @@ class UITranscriptionService:
 
     def request(self, audio_id: int) -> str | None:
         state = self.database.queue_transcription(audio_id)
-        if state is None or state == "running":
+        if state is None or state in {"running", "skipped"}:
             return state
         with self._lock:
             previous = self._active.get(audio_id)

@@ -58,7 +58,15 @@ def test_ui_api_lists_details_and_streams_range(tmp_path: Path):
 
         with urlopen(f"{base}/", timeout=3) as response:
             assert response.status == 200
-            assert b"CallForge" in response.read()
+            page = response.read()
+            assert b"CallForge" in page
+            assert b'class="markdown-body" id="transcript"' in page
+            assert b'<option value="skipped">' in page
+
+        with urlopen(f"{base}/app.js", timeout=3) as response:
+            javascript = response.read()
+            assert b"function renderMarkdown" in javascript
+            assert b'renderMarkdown($("transcript")' in javascript
 
         with urlopen(f"{base}/Vazirmatn.woff2", timeout=3) as response:
             assert response.status == 200

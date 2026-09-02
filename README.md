@@ -13,6 +13,7 @@ CallForge یک ابزار خط فرمان محلی و قابل‌ادامه بر
 - واردکردن خودکار Markdownهای قبلی هنگام scan
 - UI فارسی روی localhost برای جست‌وجو، مشاهدهٔ متادیتا، پخش صوت و خواندن transcript
 - اجرای transcription یا transcription مجدد یک فایل مشخص مستقیماً از UI
+- نگه‌داری تماس‌های نمایش‌داده‌شده با مدت `۰:۰۰` فقط به‌عنوان inventory با وضعیت `skipped`، خارج از آمار و transcription
 - آماده برای stageهای آینده از طریق جدول‌های عمومی `jobs`، `processing_runs` و `artifacts`
 
 نگاشت نوع تماس از روی پیشوند نام فایل انجام می‌شود:
@@ -88,9 +89,38 @@ callforge scan "/path/to/audio-root"
 callforge workspace
 callforge transcripts --limit 20
 callforge retry
+callforge reset
 ```
 
 `scan DIRECTORY` علاوه بر به‌روزرسانی فایل‌ها، همان دایرکتوری را workspace فعال می‌کند. بنابراین برای جابه‌جایی بین دو آرشیو کافی است دایرکتوری موردنظر را با `init` یا `scan` انتخاب کنید. `callforge workspace` مسیر دایرکتوری فعال و دیتابیس آن را نمایش می‌دهد.
+
+## پاک‌کردن داده‌های دیتابیس
+
+برای خالی‌کردن کامل دیتابیس workspace فعال:
+
+```bash
+callforge reset
+```
+
+برای حذف فقط رکوردهای مربوط به یک زیرشاخهٔ مشخص:
+
+```bash
+callforge reset "/path/to/audio-root/2026/04"
+```
+
+مسیر نسبی نیز نسبت به audio root فعال پذیرفته می‌شود:
+
+```bash
+callforge reset "2026/04"
+```
+
+این فرمان فایل‌های MP3 و Markdown را حذف نمی‌کند؛ فقط `audio_files` انتخاب‌شده و relationهای دیتابیسی آن‌ها شامل job، processing run، transcript و artifact پاک می‌شوند. قبل از حذف باید عبارت `RESET` را وارد کنید. برای اسکریپت‌های خودکار می‌توان confirmation را با `--yes` رد کرد:
+
+```bash
+callforge reset "2026/04" --yes
+```
+
+اگر یکی از فایل‌های هدف در حال پردازش باشد، reset انجام نمی‌شود. همچنین اجرای دوبارهٔ `scan` فایل‌هایی را که هنوز روی دیسک هستند مجدداً وارد دیتابیس می‌کند.
 
 ## فایل‌های هر workspace
 

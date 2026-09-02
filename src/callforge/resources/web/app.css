@@ -81,6 +81,7 @@ tbody tr.selected { background: var(--green-soft); box-shadow: inset -3px 0 var(
 .status-pending { color: var(--amber); background: var(--amber-soft); }
 .status-running { color: var(--blue); background: var(--blue-soft); }
 .status-failed { color: var(--red); background: var(--red-soft); }
+.status-skipped { color: #626b66; background: #ecefed; }
 .empty { position: absolute; inset: 80px 0 0; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--muted); gap: 8px; }
 .empty div { font-size: 42px; color: #aab5af; }
 .empty strong { color: var(--ink); }
@@ -104,7 +105,7 @@ tbody tr.selected { background: var(--green-soft); box-shadow: inset -3px 0 var(
 .detail-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
 .transcribe-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 128px; border: 0; border-radius: 10px; padding: 10px 13px; background: var(--green); color: white; font-size: 11px; font-weight: 700; box-shadow: 0 7px 18px rgba(25,108,77,.18); transition: transform .15s ease, opacity .15s ease; }
 .transcribe-button:hover:not(:disabled) { transform: translateY(-1px); }
-.transcribe-button:disabled { cursor: wait; opacity: .55; box-shadow: none; }
+.transcribe-button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .transcribe-button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .player-card { margin: 20px 0; padding: 13px; border: 1px solid var(--line); border-radius: 13px; background: white; }
 audio { display: block; width: 100%; height: 42px; }
@@ -116,7 +117,26 @@ audio { display: block; width: 100%; height: 42px; }
 .transcript-heading { padding: 16px 18px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--line); }
 .transcript-heading h3 { margin: 4px 0 0; font-size: 15px; }
 .transcript-heading > span { color: var(--muted); font-size: 10px; }
-#transcript { margin: 0; padding: 20px; max-height: 430px; overflow: auto; white-space: pre-wrap; font: 13px/2 "Vazirmatn", Tahoma, "Segoe UI", sans-serif; color: #29332e; direction: rtl; }
+.markdown-body { margin: 0; padding: 22px; max-height: 520px; overflow: auto; font: 13px/2 "Vazirmatn", Tahoma, "Segoe UI", sans-serif; color: #29332e; direction: rtl; overflow-wrap: anywhere; }
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body > :last-child { margin-bottom: 0; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { color: var(--ink); line-height: 1.65; }
+.markdown-body h1 { margin: 0 0 18px; padding-bottom: 11px; border-bottom: 1px solid var(--line); font-size: 21px; }
+.markdown-body h2 { margin: 26px 0 14px; padding: 8px 12px; border-right: 3px solid var(--green); border-radius: 7px; background: #f3f8f5; font-size: 16px; }
+.markdown-body h3 { margin: 22px 0 10px; font-size: 14px; }
+.markdown-body h4, .markdown-body h5, .markdown-body h6 { margin: 18px 0 8px; font-size: 13px; }
+.markdown-body p { margin: 0 0 13px; }
+.markdown-body ul, .markdown-body ol { margin: 0 0 18px; padding: 0 24px 0 0; }
+.markdown-body li { margin: 3px 0; padding-right: 2px; }
+.markdown-body strong { color: var(--green); font-weight: 800; }
+.markdown-body em { color: #5f6b65; }
+.markdown-body code { direction: ltr; unicode-bidi: embed; display: inline-block; padding: 1px 6px; border: 1px solid #e2e8e4; border-radius: 5px; background: #f4f6f4; color: #344b40; font: 11px/1.8 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.markdown-body pre { direction: ltr; margin: 0 0 16px; padding: 14px; overflow: auto; border: 1px solid #dfe6e1; border-radius: 9px; background: #f4f6f4; text-align: left; }
+.markdown-body pre code { display: inline; padding: 0; border: 0; background: transparent; white-space: pre; }
+.markdown-body blockquote { margin: 0 0 16px; padding: 8px 14px; border-right: 3px solid #8eb5a2; background: #f6faf7; color: #56635c; }
+.markdown-body blockquote p { margin: 0; }
+.markdown-body hr { height: 1px; margin: 22px 0; border: 0; background: var(--line); }
+.markdown-body a { color: var(--blue); text-decoration: underline; text-underline-offset: 3px; }
 .no-transcript { padding: 45px 20px; text-align: center; color: var(--muted); font-size: 12px; }
 .toast { position: fixed; left: 24px; bottom: 24px; padding: 12px 16px; border-radius: 10px; background: #27312c; color: white; font-size: 12px; box-shadow: var(--shadow); }
 

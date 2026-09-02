@@ -8,6 +8,7 @@ const statusLabels = {
   pending: "در انتظار",
   running: "در حال پردازش",
   failed: "ناموفق",
+  skipped: "مدت صفر",
 };
 
 const directionLabels = {
@@ -43,6 +44,141 @@ function dateTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.valueOf())) return value;
   return new Intl.DateTimeFormat("fa-IR", { dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+
+function appendInlineMarkdown(parent, source) {
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_|\[[^\]\n]+\]\([^\s)]+\))/g;
+  let cursor = 0;
+  for (const match of source.matchAll(pattern)) {
+    if (match.index > cursor) parent.append(document.createTextNode(source.slice(cursor, match.index)));
+    const token = match[0];
+    let element;
+    let value;
+    if (token.startsWith("`")) {
+      element = document.createElement("code");
+      value = token.slice(1, -1);
+    } else if (token.startsWith("**") || token.startsWith("__")) {
+      element = document.createElement("strong");
+      value = token.slice(2, -2);
+    } else if (token.startsWith("*") || token.startsWith("_")) {
+      element = document.createElement("em");
+      value = token.slice(1, -1);
+    } else {
+      const parts = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      value = parts?.[1] || token;
+      try {
+        const target = new URL(parts?.[2] || "", window.location.href);
+        if (!["http:", "https:", "mailto:"].includes(target.protocol)) throw new Error("unsafe link");
+        element = document.createElement("a");
+        element.href = target.href;
+        element.target = "_blank";
+        element.rel = "noopener noreferrer";
+      } catch {
+        element = document.createElement("span");
+      }
+    }
+    element.textContent = value;
+    parent.append(element);
+    cursor = match.index + token.length;
+  }
+  if (cursor < source.length) parent.append(document.createTextNode(source.slice(cursor)));
+}
+
+function startsMarkdownBlock(line) {
+  return /^(#{1,6})\s+/.test(line)
+    || /^\s*([-+*])\s+/.test(line)
+    || /^\s*\d+[.)]\s+/.test(line)
+    || /^>\s?/.test(line)
+    || /^```/.test(line)
+    || /^\s*((\*|-|_)\s*){3,}$/.test(line);
+}
+
+function renderMarkdown(target, markdown) {
+  const fragment = document.createDocumentFragment();
+  const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) { index += 1; continue; }
+
+    const fence = line.match(/^```\s*([\w-]*)\s*$/);
+    if (fence) {
+      const contents = [];
+      index += 1;
+      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
+        contents.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (fence[1]) code.className = `language-${fence[1]}`;
+      code.textContent = contents.join("\n");
+      pre.append(code);
+      fragment.append(pre);
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const element = document.createElement(`h${heading[1].length}`);
+      appendInlineMarkdown(element, heading[2].replace(/\s+#+\s*$/, ""));
+      fragment.append(element);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*((\*|-|_)\s*){3,}$/.test(line)) {
+      fragment.append(document.createElement("hr"));
+      index += 1;
+      continue;
+    }
+
+    const unordered = line.match(/^\s*[-+*]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      const listElement = document.createElement(unordered ? "ul" : "ol");
+      const itemPattern = unordered ? /^\s*[-+*]\s+(.+)$/ : /^\s*\d+[.)]\s+(.+)$/;
+      while (index < lines.length) {
+        const itemMatch = lines[index].match(itemPattern);
+        if (!itemMatch) break;
+        const item = document.createElement("li");
+        appendInlineMarkdown(item, itemMatch[1]);
+        listElement.append(item);
+        index += 1;
+      }
+      fragment.append(listElement);
+      continue;
+    }
+
+    if (/^>\s?/.test(line)) {
+      const quote = document.createElement("blockquote");
+      const paragraph = document.createElement("p");
+      const quoteLines = [];
+      while (index < lines.length && /^>\s?/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^>\s?/, ""));
+        index += 1;
+      }
+      appendInlineMarkdown(paragraph, quoteLines.join("\n"));
+      quote.append(paragraph);
+      fragment.append(quote);
+      continue;
+    }
+
+    const paragraph = document.createElement("p");
+    const paragraphLines = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !startsMarkdownBlock(lines[index])) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    paragraphLines.forEach((value, lineIndex) => {
+      if (lineIndex) paragraph.append(document.createElement("br"));
+      appendInlineMarkdown(paragraph, value);
+    });
+    fragment.append(paragraph);
+  }
+  target.replaceChildren(fragment);
 }
 
 function badge(status) {
@@ -168,9 +304,10 @@ function isInteractivelyQueued(item) {
 function updateTranscribeButton(item) {
   const button = $("transcribe-button");
   const label = button.querySelector("span");
-  const processing = item.job_status === "running" || isInteractivelyQueued(item);
+  const processing = item.job_status === "running" || item.job_status === "skipped" || isInteractivelyQueued(item);
   button.disabled = processing;
-  if (item.job_status === "running") label.textContent = "در حال تبدیل…";
+  if (item.job_status === "skipped") label.textContent = "غیرقابل پردازش";
+  else if (item.job_status === "running") label.textContent = "در حال تبدیل…";
   else if (isInteractivelyQueued(item)) label.textContent = "در صف پردازش";
   else if (item.transcript_id) label.textContent = "تبدیل مجدد";
   else label.textContent = "تبدیل به متن";
@@ -215,7 +352,7 @@ async function selectFile(id, reloadAudio = true) {
     const hasTranscript = Boolean(item.transcript_id && item.transcript_content);
     $("transcript").classList.toggle("hidden", !hasTranscript);
     $("no-transcript").classList.toggle("hidden", hasTranscript);
-    $("transcript").textContent = item.transcript_content || "";
+    renderMarkdown($("transcript"), item.transcript_content || "");
     $("transcript-version").textContent = hasTranscript ? `نسخه ${faNumber(item.transcript_version)} · ${dateTime(item.transcript_created_at)}` : "";
   } catch (error) {
     showToast(error.message);
@@ -234,7 +371,8 @@ async function transcribeSelected() {
   button.querySelector("span").textContent = "در حال ارسال…";
   try {
     const result = await post(`/api/files/${item.id}/transcribe`);
-    showToast(result.status === "running" ? "این فایل در حال پردازش است." : "فایل به صف پردازش اضافه شد.");
+    if (result.status === "skipped") showToast("تماس‌های با مدت صفر قابل پردازش نیستند.");
+    else showToast(result.status === "running" ? "این فایل در حال پردازش است." : "فایل به صف پردازش اضافه شد.");
     await Promise.all([selectFile(item.id, false), loadFiles(), loadStats()]);
   } catch (error) {
     showToast(error.message);
