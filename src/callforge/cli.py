@@ -8,6 +8,7 @@ from callforge import __version__
 from callforge.codex_runner import CodexRunner
 from callforge.config import AppConfig
 from callforge.db import Database
+from callforge.registry import get_active_root, set_active_root
 from callforge.scanner import scan
 from callforge.setup_tools import checks, setup
 from callforge.worker import run_batch
@@ -21,8 +22,9 @@ def positive_int(value: str) -> int:
     return parsed
 
 
-def workspace(directory: str) -> tuple[AppConfig, Database]:
-    config = AppConfig.for_root(Path(directory))
+def workspace(directory: str | None = None) -> tuple[AppConfig, Database]:
+    root = Path(directory) if directory is not None else get_active_root()
+    config = AppConfig.for_root(root)
     config.ensure()
     database = Database(config.database)
     database.initialize()
@@ -39,7 +41,9 @@ def print_checks(items) -> bool:
 def command_init(args) -> int:
     config, database = workspace(args.directory)
     result = scan(config, database, import_markdown=True)
+    set_active_root(config.root)
     print(f"Initialized {config.workspace}")
+    print(f"Active audio directory: {config.root}")
     print(
         f"Indexed {result.discovered} MP3 files; {result.imported_markdown} existing Markdown transcripts imported."
     )
@@ -49,6 +53,8 @@ def command_init(args) -> int:
 def command_scan(args) -> int:
     config, database = workspace(args.directory)
     result = scan(config, database, import_markdown=not args.no_import_markdown)
+    set_active_root(config.root)
+    print(f"Active audio directory: {config.root}")
     print(
         f"Indexed {result.discovered} MP3 files; changed={result.changed}, "
         f"metadata_errors={result.metadata_errors}, imported_markdown={result.imported_markdown}."
@@ -57,10 +63,7 @@ def command_scan(args) -> int:
 
 
 def command_run(args) -> int:
-    config, database = workspace(args.directory)
-    if not args.no_scan:
-        discovered = scan(config, database, import_markdown=True)
-        print(f"Scan: {discovered.discovered} MP3 files indexed.")
+    config, database = workspace()
     batch_size = args.batch_size if args.batch_size is not None else config.batch_size
     workers = args.workers if args.workers is not None else config.workers
     if args.dry_run:
@@ -78,21 +81,28 @@ def command_run(args) -> int:
 
 
 def command_status(args) -> int:
-    _, database = workspace(args.directory)
+    _, database = workspace()
     values = database.counts()
     for key in ("audio_files", "pending", "running", "completed", "failed", "transcripts", "current_transcripts"):
         print(f"{key}: {values.get(key, 0)}")
     return 0
 
 
+def command_workspace(args) -> int:
+    config, _ = workspace()
+    print(f"Audio directory: {config.root}")
+    print(f"Database: {config.database}")
+    return 0
+
+
 def command_retry(args) -> int:
-    _, database = workspace(args.directory)
+    _, database = workspace()
     print(f"Requeued {database.retry_failed()} failed jobs.")
     return 0
 
 
 def command_transcripts(args) -> int:
-    _, database = workspace(args.directory)
+    _, database = workspace()
     rows = database.recent_transcripts(args.limit)
     for row in rows:
         print(
@@ -102,10 +112,7 @@ def command_transcripts(args) -> int:
 
 
 def command_ui(args) -> int:
-    config, database = workspace(args.directory)
-    if not args.no_scan:
-        result = scan(config, database, import_markdown=True)
-        print(f"Scan: {result.discovered} MP3 files indexed.")
+    config, database = workspace()
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         print(
             "Warning: UI is being exposed beyond localhost. Audio and transcripts have no authentication.",
@@ -144,32 +151,28 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.set_defaults(func=command_scan)
 
     run = subparsers.add_parser("run", help="Transcribe one configurable batch")
-    run.add_argument("directory")
     run.add_argument("--batch-size", type=positive_int)
     run.add_argument("--workers", type=positive_int)
-    run.add_argument("--no-scan", action="store_true")
     run.add_argument("--dry-run", action="store_true")
     run.set_defaults(func=command_run)
 
     status = subparsers.add_parser("status", help="Show queue and transcript counts")
-    status.add_argument("directory")
     status.set_defaults(func=command_status)
 
+    current = subparsers.add_parser("workspace", help="Show the active audio directory and database")
+    current.set_defaults(func=command_workspace)
+
     retry = subparsers.add_parser("retry", help="Requeue terminal failures")
-    retry.add_argument("directory")
     retry.set_defaults(func=command_retry)
 
     transcripts = subparsers.add_parser("transcripts", help="List current transcripts")
-    transcripts.add_argument("directory")
     transcripts.add_argument("--limit", type=positive_int, default=20)
     transcripts.set_defaults(func=command_transcripts)
 
     ui = subparsers.add_parser("ui", help="Open the local audio and transcript browser")
-    ui.add_argument("directory")
     ui.add_argument("--host", default="127.0.0.1")
     ui.add_argument("--port", type=positive_int, default=8765)
     ui.add_argument("--no-open", action="store_true", help="Do not open the browser automatically")
-    ui.add_argument("--no-scan", action="store_true", help="Serve the current database without scanning")
     ui.set_defaults(func=command_ui)
     return parser
 
