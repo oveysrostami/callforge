@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>CallForge</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23196c4d'/%3E%3Cpath d='M17 34h6l4-14 8 28 5-18 4 4h5' fill='none' stroke='white' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">آرشیو تماس‌ها</p>
+        <h1>CallForge</h1>
+      </div>
+      <div class="connection" id="connection"><span></span> متصل به دیتابیس محلی</div>
+    </header>
+
+    <main>
+      <section class="stats" aria-label="خلاصه وضعیت">
+        <article><span>فایل صوتی</span><strong id="stat-files">—</strong></article>
+        <article><span>متن آماده</span><strong id="stat-transcripts">—</strong></article>
+        <article><span>در انتظار</span><strong id="stat-pending">—</strong></article>
+        <article><span>ناموفق</span><strong id="stat-failed">—</strong></article>
+      </section>
+
+      <section class="workspace">
+        <div class="library-panel">
+          <div class="toolbar">
+            <label class="search-field">
+              <span class="sr-only">جست‌وجو</span>
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m21 21-4.35-4.35m2.35-5.65a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z"/></svg>
+              <input id="search" type="search" placeholder="نام فایل، شماره یا داخلی…" autocomplete="off">
+            </label>
+            <label>
+              <span class="sr-only">جهت تماس</span>
+              <select id="direction">
+                <option value="">همه جهت‌ها</option>
+                <option value="inbound">ورودی</option>
+                <option value="outbound">خروجی</option>
+                <option value="internal">داخلی به داخلی</option>
+              </select>
+            </label>
+            <label>
+              <span class="sr-only">وضعیت پردازش</span>
+              <select id="status">
+                <option value="">همه وضعیت‌ها</option>
+                <option value="completed">متن آماده</option>
+                <option value="pending">در انتظار</option>
+                <option value="running">در حال پردازش</option>
+                <option value="failed">ناموفق</option>
+              </select>
+            </label>
+            <label>
+              <span class="sr-only">وضعیت متن</span>
+              <select id="transcript-filter">
+                <option value="">همه متن‌ها</option>
+                <option value="yes">دارای متن</option>
+                <option value="no">بدون متن</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="result-heading">
+            <h2>فایل‌ها</h2>
+            <span id="result-count">در حال دریافت…</span>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>تماس</th>
+                  <th>زمان</th>
+                  <th>مدت</th>
+                  <th>وضعیت</th>
+                </tr>
+              </thead>
+              <tbody id="file-list"></tbody>
+            </table>
+            <div class="empty hidden" id="empty-state">
+              <div>⌁</div>
+              <strong>فایلی پیدا نشد</strong>
+              <span>فیلترها را تغییر دهید یا دوباره scan کنید.</span>
+            </div>
+          </div>
+
+          <nav class="pagination" aria-label="صفحه‌بندی">
+            <button id="next-page" type="button">صفحه بعد</button>
+            <span id="page-label">—</span>
+            <button id="prev-page" type="button">صفحه قبل</button>
+          </nav>
+        </div>
+
+        <aside class="detail-panel" id="detail-panel">
+          <div class="detail-empty" id="detail-empty">
+            <div class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <h2>یک تماس را انتخاب کنید</h2>
+            <p>فایل صوتی، متادیتا و متن تماس اینجا نمایش داده می‌شود.</p>
+          </div>
+
+          <div class="detail-content hidden" id="detail-content">
+            <div class="detail-title">
+              <div>
+                <p class="eyebrow" id="detail-direction">—</p>
+                <h2 id="detail-name">—</h2>
+                <p id="detail-path">—</p>
+              </div>
+              <div class="detail-actions">
+                <span class="status-badge" id="detail-status">—</span>
+                <button class="transcribe-button" id="transcribe-button" type="button">
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 19h14"/></svg>
+                  <span>تبدیل به متن</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="player-card">
+              <audio id="audio-player" controls preload="metadata"></audio>
+            </div>
+
+            <dl class="metadata" id="metadata"></dl>
+
+            <section class="transcript-card">
+              <div class="transcript-heading">
+                <div>
+                  <p class="eyebrow">خروجی پردازش</p>
+                  <h3>متن تماس</h3>
+                </div>
+                <span id="transcript-version"></span>
+              </div>
+              <pre id="transcript"></pre>
+              <div class="no-transcript hidden" id="no-transcript">هنوز متنی برای این فایل ثبت نشده است.</div>
+            </section>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <div class="toast hidden" id="toast" role="status"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

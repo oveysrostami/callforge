@@ -1,0 +1,5 @@
+interface:
+  display_name: "PBX Call Transcriber"
+  short_description: "Transcribe Persian support calls locally with Whisper"
+  default_prompt: "Use $pbx-call-transcriber to transcribe this MP3 into a reviewed Markdown file beside it."
+
