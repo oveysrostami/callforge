@@ -74,7 +74,8 @@
                 <tr>
                   <th>تماس</th>
                   <th>زمان</th>
-                  <th>مدت</th>
+                  <th>مدت تماس</th>
+                  <th>زمان پردازش</th>
                   <th>وضعیت</th>
                 </tr>
               </thead>
@@ -122,6 +123,20 @@
             </div>
 
             <dl class="metadata" id="metadata"></dl>
+
+            <section class="progress-card hidden" id="progress-card" aria-live="polite">
+              <div class="progress-heading">
+                <div class="progress-status-icon" id="progress-status-icon" aria-hidden="true"><span></span></div>
+                <div>
+                  <p class="eyebrow">وضعیت زندهٔ پردازش</p>
+                  <h3 id="progress-title">در حال آماده‌سازی…</h3>
+                  <p id="progress-meta">در انتظار دریافت اولین رویداد</p>
+                  <p class="progress-error hidden" id="progress-error"></p>
+                </div>
+              </div>
+              <ol class="progress-events" id="progress-events"></ol>
+              <p class="progress-connection" id="progress-connection">اتصال زنده برقرار است</p>
+            </section>
 
             <section class="transcript-card">
               <div class="transcript-heading">

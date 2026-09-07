@@ -4,6 +4,7 @@ import json
 import mimetypes
 import re
 import threading
+import time
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,12 +16,14 @@ from urllib.parse import parse_qs, urlparse
 from callforge import __version__
 from callforge.config import AppConfig
 from callforge.db import Database
+from callforge.progress import read_progress_events
 from callforge.ui_jobs import UITranscriptionService
 
 
 AUDIO_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/audio$")
 DETAIL_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)$")
 TRANSCRIBE_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/transcribe$")
+PROGRESS_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/progress$")
 STATIC_FILES = {
     "/": "index.html",
     "/index.html": "index.html",
@@ -106,6 +109,14 @@ def make_handler(
                 if parsed.path == "/api/files":
                     self._files(parse_qs(parsed.query), send_body)
                     return
+                progress_match = PROGRESS_ROUTE.match(parsed.path)
+                if progress_match:
+                    self._progress(
+                        int(progress_match.group("id")),
+                        send_body,
+                        once=parse_qs(parsed.query).get("once", [""])[0] == "1",
+                    )
+                    return
                 audio_match = AUDIO_ROUTE.match(parsed.path)
                 if audio_match:
                     self._audio(int(audio_match.group("id")), send_body)
@@ -115,7 +126,7 @@ def make_handler(
                     self._detail(int(detail_match.group("id")), send_body)
                     return
                 self._error(HTTPStatus.NOT_FOUND, "مسیر پیدا نشد", send_body)
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError):
                 return
             except Exception as exc:
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), send_body)
@@ -147,6 +158,89 @@ def make_handler(
                 return
             detail["audio_url"] = f"/api/files/{audio_id}/audio"
             self._json(detail, send_body=send_body)
+
+        @staticmethod
+        def _public_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
+            keys = (
+                "audio_id", "filename", "job_status", "attempts", "max_attempts",
+                "claimed_at", "lease_expires_at", "last_error", "run_id",
+                "run_status", "run_attempt", "started_at", "finished_at", "run_error",
+                "processing_total_seconds",
+            )
+            result = {key: snapshot.get(key) for key in keys}
+            for key in ("last_error", "run_error"):
+                value = result.get(key)
+                if isinstance(value, str) and len(value) > 800:
+                    result[key] = value[:799].rstrip() + "…"
+            return result
+
+        def _sse(self, event: str, value: object, event_id: str | None = None) -> None:
+            payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            parts = []
+            if event_id:
+                parts.append(f"id: {event_id}\n")
+            parts.append(f"event: {event}\n")
+            for line in payload.splitlines() or [""]:
+                parts.append(f"data: {line}\n")
+            parts.append("\n")
+            self.wfile.write("".join(parts).encode("utf-8"))
+            self.wfile.flush()
+
+        def _progress(self, audio_id: int, send_body: bool, *, once: bool = False) -> None:
+            snapshot = database.processing_snapshot(audio_id)
+            if snapshot is None:
+                self._error(HTTPStatus.NOT_FOUND, "فایل در دیتابیس پیدا نشد", send_body)
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("Connection", "close" if once else "keep-alive")
+            self.end_headers()
+            if not send_body:
+                return
+
+            deadline = time.monotonic() + 55
+            last_snapshot = ""
+            current_run_id: object = object()
+            line_offset = 0
+            while time.monotonic() < deadline:
+                snapshot = database.processing_snapshot(audio_id)
+                if snapshot is None:
+                    self._sse("done", {"job_status": "missing"})
+                    self.close_connection = True
+                    return
+                run_id = snapshot.get("run_id")
+                if run_id != current_run_id:
+                    current_run_id = run_id
+                    line_offset = 0
+                public = self._public_snapshot(snapshot)
+                serialized = json.dumps(public, ensure_ascii=False, sort_keys=True)
+                if serialized != last_snapshot:
+                    self._sse("snapshot", public, f"snapshot-{run_id or 0}")
+                    last_snapshot = serialized
+
+                line_offset, events = read_progress_events(
+                    snapshot.get("log_path"), after_line=line_offset, maximum=500
+                )
+                for progress_event in events:
+                    self._sse(
+                        "progress",
+                        progress_event,
+                        f"run-{run_id or 0}-line-{progress_event['line']}",
+                    )
+
+                status = snapshot.get("job_status")
+                if status in {"completed", "failed", "skipped"}:
+                    self._sse("done", public, f"done-{run_id or 0}")
+                    self.close_connection = True
+                    return
+                if once:
+                    self.close_connection = True
+                    return
+                self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+                time.sleep(0.75)
+            self.close_connection = True
 
         def _audio(self, audio_id: int, send_body: bool) -> None:
             audio_path = database.audio_path(audio_id)

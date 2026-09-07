@@ -67,11 +67,66 @@ def test_ui_api_lists_details_and_streams_range(tmp_path: Path):
             javascript = response.read()
             assert b"function renderMarkdown" in javascript
             assert b'renderMarkdown($("transcript")' in javascript
+            assert b"new EventSource" in javascript
+
+        with urlopen(f"{base}/", timeout=3) as response:
+            assert b'id="progress-card"' in response.read()
 
         with urlopen(f"{base}/Vazirmatn.woff2", timeout=3) as response:
             assert response.status == 200
             assert response.headers["Content-Type"] == "font/woff2"
             assert response.read(4) == b"wOF2"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_progress_endpoint_streams_snapshot_and_summarized_codex_events(tmp_path: Path):
+    server, thread, audio_id = prepared_server(tmp_path)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    config = AppConfig.for_root(tmp_path)
+    database = Database(config.database)
+    try:
+        assert database.queue_transcription(audio_id) == "queued"
+        job = database.claim_audio_job(audio_id, "test-worker", 120)
+        assert job is not None
+        log_path = config.logs / "live.jsonl"
+        stderr_path = config.logs / "live.stderr.log"
+        log_path.write_text(
+            '{"type":"thread.started","thread_id":"test"}\n'
+            '{"type":"item.started","item":{"type":"command_execution",'
+            '"status":"in_progress","command":"python prepare_audio.py call.mp3"}}\n',
+            encoding="utf-8",
+        )
+        stderr_path.write_text("", encoding="utf-8")
+        run_id = database.start_run(job, "test-worker", log_path, stderr_path)
+
+        with urlopen(f"{base}/api/files/{audio_id}/progress?once=1", timeout=3) as response:
+            body = response.read().decode("utf-8")
+            assert response.headers["Content-Type"].startswith("text/event-stream")
+            assert "event: snapshot" in body
+            assert '"job_status":"running"' in body
+            assert "event: progress" in body
+            assert "آماده‌سازی، اندازه‌گیری و تقویت صدا" in body
+
+        markdown_path = tmp_path / "external-208-09120000000-20260408-143257-id.md"
+        content = "# متن تماس\n\n**کارشناس:** انجام شد"
+        markdown_path.write_text(content, encoding="utf-8")
+        database.complete_run(job, run_id, content, markdown_path, "fa", "test")
+        detail = database.audio_file_detail(audio_id)
+        assert detail and detail["latest_run_id"] == run_id
+        assert detail["latest_run_status"] == "completed"
+        assert float(detail["processing_total_seconds"]) >= 0
+        assert log_path.is_file()
+        _, listed = database.list_audio_files()
+        assert listed[0]["latest_run_id"] == run_id
+        assert float(listed[0]["processing_total_seconds"]) >= 0
+
+        with urlopen(f"{base}/api/files/{audio_id}/progress?once=1", timeout=3) as response:
+            historical = response.read().decode("utf-8")
+            assert '"job_status":"completed"' in historical
+            assert "آماده‌سازی، اندازه‌گیری و تقویت صدا" in historical
     finally:
         server.shutdown()
         server.server_close()

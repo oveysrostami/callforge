@@ -53,21 +53,30 @@ class CodexRunner:
             "--skip-git-repo-check",
             self.build_prompt(audio_path),
         ]
-        completed = subprocess.run(
-            command,
-            cwd=self.config.root,
-            env=self.config.runtime_environment(),
-            capture_output=True,
-            text=True,
-        )
-        log_path.write_text(completed.stdout, encoding="utf-8")
-        stderr_path.write_text(completed.stderr, encoding="utf-8")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Write directly to disk while Codex is running. The UI tails these
+        # files, so capture_output=True would hide all progress until exit.
+        with (
+            log_path.open("w", encoding="utf-8", buffering=1) as stdout_handle,
+            stderr_path.open("w", encoding="utf-8", buffering=1) as stderr_handle,
+        ):
+            process = subprocess.Popen(
+                command,
+                cwd=self.config.root,
+                env=self.config.runtime_environment(),
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                text=True,
+            )
+            returncode = process.wait()
+        stdout = log_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
         thread_id = None
-        for line in completed.stdout.splitlines():
+        for line in stdout.splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if event.get("type") == "thread.started":
                 thread_id = event.get("thread_id")
-        return CodexResult(completed.returncode, thread_id, completed.stdout, completed.stderr)
+        return CodexResult(returncode, thread_id, stdout, stderr)

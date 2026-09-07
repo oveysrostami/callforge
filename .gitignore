@@ -8,3 +8,4 @@ dist/
 .callforge/
 .playwright-cli/
 output/
+.DS_Store

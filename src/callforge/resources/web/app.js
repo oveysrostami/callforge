@@ -1,4 +1,16 @@
-const state = { offset: 0, limit: 30, total: 0, selectedId: null, selectedItem: null, debounce: null };
+const state = {
+  offset: 0,
+  limit: 30,
+  total: 0,
+  selectedId: null,
+  selectedItem: null,
+  debounce: null,
+  progressSource: null,
+  progressAudioId: null,
+  progressRunId: null,
+  progressSnapshot: null,
+  progressSeen: new Set(),
+};
 
 const $ = (id) => document.getElementById(id);
 const list = $("file-list");
@@ -260,9 +272,11 @@ function renderRows(items) {
     time.textContent = dateTime(item.recorded_at);
     const length = document.createElement("td");
     length.textContent = duration(item.duration_seconds);
+    const processing = document.createElement("td");
+    processing.textContent = item.latest_run_id ? duration(Number(item.processing_total_seconds || 0)) : "—";
     const status = document.createElement("td");
     status.append(badge(item.job_status));
-    row.append(call, time, length, status);
+    row.append(call, time, length, processing, status);
     row.addEventListener("click", () => selectFile(item.id));
     row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectFile(item.id); });
     list.append(row);
@@ -301,6 +315,133 @@ function isInteractivelyQueued(item) {
   return item.job_status === "pending" && Number(item.job_priority || 0) >= 1000;
 }
 
+function closeProgressStream() {
+  if (state.progressSource) state.progressSource.close();
+  state.progressSource = null;
+  state.progressAudioId = null;
+  state.progressRunId = null;
+  state.progressSnapshot = null;
+  state.progressSeen = new Set();
+}
+
+function progressTime() {
+  return new Intl.DateTimeFormat("fa-IR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date());
+}
+
+function processingDuration(snapshot) {
+  if (!snapshot) return "—";
+  let seconds = Number(snapshot.processing_total_seconds || 0);
+  if (snapshot.run_status === "running" && snapshot._receivedAt) {
+    seconds += Math.max(0, (Date.now() - snapshot._receivedAt) / 1000);
+  }
+  return duration(seconds);
+}
+
+function updateProgressMeta() {
+  const snapshot = state.progressSnapshot;
+  if (!snapshot) return;
+  const attempt = Number(snapshot.run_attempt || snapshot.attempts || 0);
+  const maximum = Number(snapshot.max_attempts || 0);
+  const attemptText = attempt ? `تلاش ${faNumber(attempt)}${maximum ? ` از ${faNumber(maximum)}` : ""}` : "هنوز اجرا شروع نشده";
+  const elapsed = snapshot.started_at || Number(snapshot.processing_total_seconds || 0) > 0
+    ? `زمان پردازش کل: ${processingDuration(snapshot)}`
+    : "";
+  $("progress-meta").textContent = [attemptText, elapsed].filter(Boolean).join(" · ");
+}
+
+function renderProgressSnapshot(snapshot) {
+  const card = $("progress-card");
+  const icon = $("progress-status-icon");
+  card.classList.remove("hidden");
+  icon.className = "progress-status-icon";
+  snapshot._receivedAt = Date.now();
+  state.progressSnapshot = snapshot;
+  state.progressRunId = snapshot.run_id || state.progressRunId;
+
+  if (snapshot.job_status === "completed") {
+    icon.classList.add("done");
+    $("progress-title").textContent = "پردازش با موفقیت تمام شد";
+  } else if (snapshot.job_status === "failed") {
+    icon.classList.add("failed");
+    $("progress-title").textContent = "پردازش ناموفق بود";
+  } else if (snapshot.job_status === "pending") {
+    $("progress-title").textContent = snapshot.run_status === "failed" ? "در انتظار تلاش مجدد" : "در صف شروع پردازش";
+  } else {
+    $("progress-title").textContent = "پردازش در حال اجراست";
+  }
+  const error = snapshot.run_error || snapshot.last_error;
+  const errorElement = $("progress-error");
+  errorElement.textContent = error && snapshot.job_status === "failed" ? error : "";
+  errorElement.classList.toggle("hidden", !errorElement.textContent);
+  updateProgressMeta();
+}
+
+function appendProgressEvent(progress) {
+  const key = `${state.progressRunId || 0}:${progress.line || 0}:${progress.stage || ""}:${progress.message || ""}`;
+  if (state.progressSeen.has(key)) return;
+  state.progressSeen.add(key);
+  const item = document.createElement("li");
+  item.className = progress.state || "";
+  const message = document.createElement("span");
+  const time = document.createElement("time");
+  message.textContent = progress.message || "رویداد جدید پردازش";
+  time.textContent = progressTime();
+  item.append(message, time);
+  const events = $("progress-events");
+  events.prepend(item);
+  while (events.children.length > 200) events.lastElementChild.remove();
+  if (progress.state === "active") $("progress-title").textContent = progress.message;
+}
+
+function openProgressStream(item) {
+  const active = item.job_status === "running" || isInteractivelyQueued(item);
+  const hasHistory = Boolean(item.latest_run_id) && ["completed", "failed"].includes(item.job_status);
+  const shouldShow = active || hasHistory;
+  $("progress-card").classList.toggle("hidden", !shouldShow);
+  if (!shouldShow) {
+    closeProgressStream();
+    return;
+  }
+  if (state.progressSource && state.progressAudioId === item.id) return;
+  closeProgressStream();
+  $("progress-events").replaceChildren();
+  state.progressAudioId = item.id;
+  const source = new EventSource(`/api/files/${item.id}/progress${active ? "" : "?once=1"}`);
+  state.progressSource = source;
+  $("progress-connection").textContent = "در حال برقراری اتصال زنده…";
+  $("progress-connection").classList.add("reconnecting");
+  source.onopen = () => {
+    $("progress-connection").textContent = "اتصال زنده برقرار است";
+    $("progress-connection").classList.remove("reconnecting");
+  };
+  source.addEventListener("snapshot", (event) => {
+    if (state.progressAudioId !== item.id) return;
+    renderProgressSnapshot(JSON.parse(event.data));
+  });
+  source.addEventListener("progress", (event) => {
+    if (state.progressAudioId !== item.id) return;
+    appendProgressEvent(JSON.parse(event.data));
+  });
+  source.addEventListener("done", async (event) => {
+    if (state.progressAudioId !== item.id) return;
+    const finalSnapshot = JSON.parse(event.data);
+    renderProgressSnapshot(finalSnapshot);
+    source.close();
+    state.progressSource = null;
+    $("progress-connection").textContent = "جریان پردازش پایان یافت";
+    if (active) {
+      await Promise.all([selectFile(item.id, false), loadFiles(), loadStats()]);
+      renderProgressSnapshot(finalSnapshot);
+    }
+    $("progress-connection").textContent = "جریان پردازش پایان یافت";
+  });
+  source.onerror = () => {
+    if (state.progressSource !== source || source.readyState === EventSource.CLOSED) return;
+    $("progress-connection").textContent = "ارتباط قطع شد؛ در حال اتصال مجدد…";
+    $("progress-connection").classList.add("reconnecting");
+  };
+}
+
 function updateTranscribeButton(item) {
   const button = $("transcribe-button");
   const label = button.querySelector("span");
@@ -335,6 +476,7 @@ async function selectFile(id, reloadAudio = true) {
       player.load();
     }
     updateTranscribeButton(item);
+    openProgressStream(item);
 
     const metadata = $("metadata");
     metadata.replaceChildren(
@@ -346,6 +488,7 @@ async function selectFile(id, reloadAudio = true) {
       metadataItem("نرخ نمونه", item.sample_rate ? `${faNumber(item.sample_rate)} Hz` : "—"),
       metadataItem("کانال", item.channels ? faNumber(item.channels) : "—"),
       metadataItem("Bitrate", item.bitrate ? `${faNumber(Math.round(item.bitrate / 1000))} kbps` : "—"),
+      metadataItem("زمان پردازش کل", item.latest_run_id ? duration(Number(item.processing_total_seconds || 0)) : "—"),
       metadataItem("تعداد نامفهوم", faNumber(item.unclear_count || 0)),
     );
 
@@ -406,3 +549,5 @@ window.setInterval(() => {
     selectFile(state.selectedId, false).catch(() => {});
   }
 }, 15000);
+
+window.setInterval(updateProgressMeta, 1000);

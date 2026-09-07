@@ -673,6 +673,30 @@ class Database:
                 (limit,),
             ).fetchall()
 
+    def processing_snapshot(self, audio_id: int) -> dict[str, object] | None:
+        """Return the queue state and latest run used by the live UI stream."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT a.id AS audio_id, a.filename, "
+                "j.id AS job_id, j.status AS job_status, j.attempts, j.max_attempts, "
+                "j.claimed_at, j.lease_expires_at, j.last_error, "
+                "pr.id AS run_id, pr.status AS run_status, pr.attempt AS run_attempt, "
+                "pr.started_at, pr.finished_at, pr.log_path, pr.stderr_path, pr.error AS run_error, "
+                "COALESCE((SELECT SUM((julianday(COALESCE(history.finished_at, CURRENT_TIMESTAMP)) "
+                "- julianday(history.started_at)) * 86400.0) FROM processing_runs history "
+                "WHERE history.audio_file_id=a.id AND history.stage='transcribe'), 0) "
+                "AS processing_total_seconds "
+                "FROM audio_files a "
+                "LEFT JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' "
+                "LEFT JOIN processing_runs pr ON pr.id=("
+                "SELECT MAX(latest.id) FROM processing_runs latest "
+                "WHERE latest.audio_file_id=a.id AND latest.stage='transcribe') "
+                "WHERE a.id=?",
+                (audio_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def list_audio_files(
         self,
         *,
@@ -722,6 +746,12 @@ class Database:
                 "a.remote_number, a.recorded_at, a.duration_seconds, a.size_bytes, a.codec, "
                 "a.bitrate, a.sample_rate, a.channels, a.metadata_error, "
                 "j.status AS job_status, j.priority AS job_priority, j.attempts, j.max_attempts, j.last_error, "
+                "(SELECT MAX(history.id) FROM processing_runs history "
+                "WHERE history.audio_file_id=a.id AND history.stage='transcribe') AS latest_run_id, "
+                "COALESCE((SELECT SUM((julianday(COALESCE(history.finished_at, CURRENT_TIMESTAMP)) "
+                "- julianday(history.started_at)) * 86400.0) FROM processing_runs history "
+                "WHERE history.audio_file_id=a.id AND history.stage='transcribe'), 0) "
+                "AS processing_total_seconds, "
                 "t.id AS transcript_id, t.version AS transcript_version, t.source AS transcript_source, "
                 "t.unclear_count, t.created_at AS transcript_created_at "
                 f"{joined} {where} "
@@ -736,11 +766,20 @@ class Database:
                 "SELECT a.*, j.status AS job_status, j.priority AS job_priority, j.attempts, j.max_attempts, j.last_error, "
                 "t.id AS transcript_id, t.version AS transcript_version, t.content AS transcript_content, "
                 "t.source AS transcript_source, t.unclear_count, t.created_at AS transcript_created_at, "
-                "t.markdown_path "
+                "t.markdown_path, pr.id AS latest_run_id, pr.status AS latest_run_status, "
+                "pr.attempt AS latest_run_attempt, pr.started_at AS processing_started_at, "
+                "pr.finished_at AS processing_finished_at, "
+                "COALESCE((SELECT SUM((julianday(COALESCE(history.finished_at, CURRENT_TIMESTAMP)) "
+                "- julianday(history.started_at)) * 86400.0) FROM processing_runs history "
+                "WHERE history.audio_file_id=a.id AND history.stage='transcribe'), 0) "
+                "AS processing_total_seconds "
                 "FROM audio_files a "
                 "LEFT JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' "
                 "LEFT JOIN transcripts t ON t.audio_file_id=a.id AND t.is_current=1 "
                 "AND (j.status IS NULL OR j.status != 'skipped') "
+                "LEFT JOIN processing_runs pr ON pr.id=("
+                "SELECT MAX(latest.id) FROM processing_runs latest "
+                "WHERE latest.audio_file_id=a.id AND latest.stage='transcribe') "
                 "WHERE a.id=?",
                 (audio_id,),
             ).fetchone()
