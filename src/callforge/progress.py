@@ -37,6 +37,11 @@ def describe_codex_event(event: dict[str, Any]) -> dict[str, str] | None:
     """Turn one Codex JSONL event into a small user-facing progress event."""
 
     event_type = event.get("type")
+    if event_type == "callforge.stage":
+        stage = _compact(event.get("stage"), 80) or "processing"
+        state = _compact(event.get("state"), 40) or "active"
+        message = _compact(event.get("message")) or "پردازش محلی CallForge"
+        return {"stage": stage, "state": state, "message": message}
     if event_type == "thread.started":
         return {"stage": "starting", "state": "completed", "message": "Codex شروع شد"}
     if event_type == "turn.started":

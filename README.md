@@ -8,6 +8,8 @@ CallForge یک ابزار خط فرمان محلی و قابل‌ادامه بر
 - استخراج hash، زمان و اندازهٔ فایل، مشخصات صوت و متادیتای نام تماس
 - صف پایدار SQLite با retry، lease و تاریخچهٔ هر اجرا
 - پردازش batch و اجرای هم‌زمان چند Codex worker
+- اجرای مستقیم دو پاس Whisper با runtime نصب‌شده و cache پایدار مدل
+- استفاده از Codex فقط برای مقایسهٔ خروجی‌ها، بازسازی نوبت‌های گفتگو و تولید Markdown
 - ساخت Markdown هم‌نام کنار MP3
 - ذخیرهٔ کامل همان Markdown به‌صورت نسخه‌دار در دیتابیس و رابطهٔ مستقیم با فایل صوتی
 - واردکردن خودکار Markdownهای قبلی هنگام scan
@@ -146,6 +148,14 @@ batch_size = 5
 workers = 2
 max_attempts = 3
 lease_seconds = 7200
+whisper_timeout_seconds = 1800
+codex_timeout_seconds = 600
+codex_idle_timeout_seconds = 120
+codex_artifact_grace_seconds = 10
+codex_reasoning_effort = "low"
+codex_model = ""
+codex_ignore_user_config = true
+codex_ignore_rules = true
 language = "fa"
 skill_name = "pbx-call-transcriber"
 ```
@@ -164,7 +174,11 @@ audio_files 1 ─── * jobs 1 ─── * processing_runs
 
 ## رفتار پردازش
 
-هر worker، skill نصب‌شده را با `codex exec` صدا می‌زند. skill صوت را محلی decode و تقویت می‌کند، چند پاس مستقل Whisper می‌گیرد، بخش‌های مبهم را بازبینی می‌کند و Markdown را می‌سازد. CallForge بعد از اعتبارسنجی فایل، محتوا را در یک تراکنش به transcript و artifact مرتبط می‌کند و سپس job را کامل علامت می‌زند. خروجی و خطای هر Codex run در `.callforge/logs` نگه‌داری می‌شود.
+هر worker ابتدا با Python محیط نصب‌شدهٔ CallForge صوت را محلی decode و تقویت می‌کند و دو پاس مستقل Whisper Turbo روی نسخهٔ خام و AGC می‌گیرد. هر دو پاس از cache پایدار `.callforge/models` استفاده می‌کنند؛ بنابراین مدل فقط در اولین استفاده از هر workspace دانلود می‌شود. سپس `codex exec` همراه skill نصب‌شده فقط خروجی‌های JSON آماده را مقایسه می‌کند، نوبت‌های گفتگو را بازسازی می‌کند و Markdown نهایی را می‌سازد. Codex اجازهٔ ساخت virtualenv، نصب پکیج، تغییر cache یا دانلود مدل تازه در این مرحله را ندارد.
+
+مهلت پیش‌فرض هر مرحلهٔ Whisper سی دقیقه، مهلت کل بازبینی Codex ده دقیقه و مهلت بی‌فعالیتی Codex دو دقیقه است و از `config.toml` قابل تغییر است. وقتی Markdown تازه ساختار معتبر داشته باشد و ده ثانیه بدون تغییر بماند، CallForge آن را نتیجهٔ نهایی در نظر می‌گیرد و process tree معطل Codex را می‌بندد؛ بنابراین قطع‌نشدن stream یا WebSocket دیگر job را بی‌دلیل در وضعیت پردازش نگه نمی‌دارد. بازبینی متنی Codex به‌صورت پیش‌فرض با reasoning سطح `low` اجرا می‌شود تا latency بی‌دلیل ایجاد نکند.
+
+اجرای Codex به‌صورت پیش‌فرض با `codex_ignore_user_config` و `codex_ignore_rules` از تنظیمات، MCPها و ruleهای نامرتبط کاربر جدا می‌شود. برای حفظ انتخاب مدل، CallForge ابتدا `codex_model` را می‌خواند؛ اگر خالی باشد فقط نام مدل فعلی را از تنظیمات عمومی Codex استخراج و آن را صریحاً به اجرای ایزوله می‌دهد. مدل Full Whisper به‌صورت خودکار دانلود نمی‌شود؛ اختلاف‌هایی که با دو پاس Turbo قابل حل نباشند با `[نامفهوم]` مشخص می‌شوند. CallForge بعد از اعتبارسنجی Markdown، محتوا را در یک تراکنش به transcript و artifact مرتبط می‌کند و سپس job را کامل علامت می‌زند. timeline و stderr هر اجرا در `.callforge/logs` باقی می‌ماند.
 
 فایل صوتی برای speech-to-text به سرویس transcription خارجی ارسال نمی‌شود. دسترسی شبکهٔ worker فقط برای دانلود اولیهٔ مدل‌های Whisper و ارتباط خود Codex فعال است و cache مدل داخل `.callforge/models` قرار می‌گیرد.
 

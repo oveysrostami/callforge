@@ -54,3 +54,19 @@ def test_reads_only_new_jsonl_progress_lines(tmp_path):
     assert len(events) == 3
     assert events[-1]["stage"] == "inspect_audio"
     assert read_progress_events(log, after_line=offset) == (3, [])
+
+
+def test_describes_native_callforge_stage():
+    event = describe_codex_event(
+        {
+            "type": "callforge.stage",
+            "stage": "model_download",
+            "state": "active",
+            "message": "دریافت یک‌بارهٔ مدل Whisper",
+        }
+    )
+    assert event == {
+        "stage": "model_download",
+        "state": "active",
+        "message": "دریافت یک‌بارهٔ مدل Whisper",
+    }
