@@ -24,6 +24,8 @@ AUDIO_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/audio$")
 DETAIL_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)$")
 TRANSCRIBE_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/transcribe$")
 PROGRESS_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/progress$")
+REVIEW_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/review$")
+SYNC_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/review/sync$")
 STATIC_FILES = {
     "/": "index.html",
     "/index.html": "index.html",
@@ -60,7 +62,9 @@ def make_handler(
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
-            match = TRANSCRIBE_ROUTE.match(parsed.path)
+            review_match = REVIEW_ROUTE.match(parsed.path)
+            sync_match = SYNC_ROUTE.match(parsed.path)
+            match = TRANSCRIBE_ROUTE.match(parsed.path) or review_match or sync_match
             if match is None:
                 self._error(HTTPStatus.NOT_FOUND, "مسیر پیدا نشد", True)
                 return
@@ -80,13 +84,25 @@ def make_handler(
             except ValueError:
                 self._error(HTTPStatus.BAD_REQUEST, "Content-Length نامعتبر است", True)
                 return
-            if length > 1024:
+            if length < 0 or length > (2_000_000 if review_match else 1024):
                 self.close_connection = True
                 self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "بدنهٔ درخواست بیش از حد بزرگ است", True)
                 return
-            if length:
-                self.rfile.read(length)
+            body = self.rfile.read(length) if length else b"{}"
             audio_id = int(match.group("id"))
+            if review_match or sync_match:
+                try:
+                    payload = json.loads(body)
+                    if not isinstance(payload, dict):
+                        raise ValueError("Expected object")
+                    if review_match:
+                        database.save_review(audio_id, payload)
+                    else:
+                        database.sync_review_markdown(audio_id, int(payload["transcript_id"]))
+                    self._json(database.review_detail(audio_id), send_body=True)
+                except (ValueError, KeyError, TypeError, OSError) as exc:
+                    self._error(HTTPStatus.CONFLICT, str(exc), True)
+                return
             state = transcription_service.request(audio_id)
             if state is None:
                 self._error(HTTPStatus.NOT_FOUND, "فایل در دیتابیس پیدا نشد", True)
@@ -108,6 +124,10 @@ def make_handler(
                     return
                 if parsed.path == "/api/files":
                     self._files(parse_qs(parsed.query), send_body)
+                    return
+                review_match = REVIEW_ROUTE.match(parsed.path)
+                if review_match:
+                    self._json(database.review_detail(int(review_match.group("id"))), send_body=send_body)
                     return
                 progress_match = PROGRESS_ROUTE.match(parsed.path)
                 if progress_match:
@@ -145,6 +165,7 @@ def make_handler(
                 direction=direction,
                 status=status,
                 transcript=transcript,
+                review=values.get("review", [""])[0],
             )
             self._json(
                 {"items": items, "total": total, "limit": limit, "offset": offset},
@@ -157,6 +178,7 @@ def make_handler(
                 self._error(HTTPStatus.NOT_FOUND, "فایل در دیتابیس پیدا نشد", send_body)
                 return
             detail["audio_url"] = f"/api/files/{audio_id}/audio"
+            detail["review"] = database.review_detail(audio_id)
             self._json(detail, send_body=send_body)
 
         @staticmethod

@@ -3,10 +3,19 @@ import os
 import sys
 from dataclasses import replace
 from pathlib import Path
+import pytest
 
 from callforge.codex_runner import CodexRunner
 from callforge.config import AppConfig
 from callforge.local_transcriber import LocalWhisperPipeline, PreparedTranscription
+
+
+@pytest.fixture(autouse=True)
+def isolate_text_review(monkeypatch):
+    # This module tests text review; speaker integration has its own tests.
+    monkeypatch.setattr("callforge.speaker_pipeline.SpeakerPipeline.preflight", lambda self: None)
+    monkeypatch.setattr("callforge.speaker_pipeline.SpeakerPipeline.run",
+                        lambda self, source, rows, *args: (rows, {"status": "completed"}))
 
 
 class FakeLocalPipeline:
@@ -15,8 +24,8 @@ class FakeLocalPipeline:
         raw = work_directory / "raw.json"
         agc = work_directory / "agc.json"
         metadata.write_text('{"duration_seconds": 1}', encoding="utf-8")
-        raw.write_text('{"text": "raw", "segments": []}', encoding="utf-8")
-        agc.write_text('{"text": "agc", "segments": []}', encoding="utf-8")
+        raw.write_text(json.dumps({"text": "سلام", "segments": [{"start": 0, "end": 1, "text": "سلام"}]}), encoding="utf-8")
+        agc.write_text(raw.read_text(encoding="utf-8"), encoding="utf-8")
         return PreparedTranscription(metadata, raw, agc)
 
 
@@ -113,12 +122,9 @@ print(json.dumps({
     events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert events[0]["stage"] == "prepare_audio"
     assert any(event["stage"] == "model_download" for event in events)
-    assert events[-1] == {
-        "type": "callforge.stage",
-        "stage": "whisper",
-        "state": "completed",
-        "message": "دو پاس مستقل Whisper کامل شد",
-    }
+    assert events[-1]["stage"] == "whisper"
+    assert events[-1]["state"] == "completed"
+    assert (work / "evidence.json").is_file()
 
 
 def test_codex_prompt_only_requests_review_of_prepared_transcripts(tmp_path):
@@ -131,14 +137,15 @@ def test_codex_prompt_only_requests_review_of_prepared_transcripts(tmp_path):
     prompt = CodexRunner(config).build_prompt(tmp_path / "call.mp3", prepared)
 
     assert "CallForge-managed review mode" in prompt
-    assert str(prepared.raw_transcript_path) in prompt
-    assert str(prepared.agc_transcript_path) in prompt
+    assert str(tmp_path / "review-input.json") in prompt
+    assert str(prepared.raw_transcript_path) not in prompt
+    assert str(prepared.agc_transcript_path) not in prompt
     assert "Do not run Whisper" in prompt
     assert "Do not change HF_HOME" in prompt
-    assert "last tool action" in prompt
+    assert "Do not write or edit files" in prompt
 
 
-def test_codex_finishes_when_valid_markdown_is_ready(tmp_path, monkeypatch):
+def test_codex_publishes_valid_structured_final_output(tmp_path, monkeypatch):
     config = replace(
         AppConfig.for_root(tmp_path),
         codex_artifact_grace_seconds=0,
@@ -160,10 +167,9 @@ def test_codex_finishes_when_valid_markdown_is_ready(tmp_path, monkeypatch):
             json.dumps({"type": "thread.started", "thread_id": "thread-1"}) + "\n"
         )
         kwargs["stdout"].flush()
-        markdown.write_text(
-            "# متن تماس\n\n## مکالمه\n\n**مشتری:** سلام\n",
-            encoding="utf-8",
-        )
+        output = Path(command[command.index("--output-last-message") + 1])
+        output.write_text(json.dumps({"segments": [{"id": "s1", "text": "سلام", "speaker": "مشتری", "uncertain": False, "notes": ""}]}), encoding="utf-8")
+        process.returncode = 0
         return process
 
     def fake_stop(selected_process):
@@ -187,12 +193,16 @@ def test_codex_finishes_when_valid_markdown_is_ready(tmp_path, monkeypatch):
     else:
         assert captured["kwargs"]["start_new_session"] is True
     events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    assert any(event.get("stage") == "artifact_ready" for event in events)
+    assert result.quality["automated_review_complete"] is True
+    assert result.evidence_directory.is_dir()
+    assert (result.evidence_directory / "raw.json").is_file()
+    assert "سلام" in markdown.read_text(encoding="utf-8")
+    assert captured["command"][captured["command"].index("--sandbox") + 1] == "read-only"
     assert events[-1]["stage"] == "review"
     assert events[-1]["state"] == "completed"
 
 
-def test_codex_hard_timeout_stops_tree_and_fails_without_artifact(
+def test_codex_hard_timeout_preserves_previous_markdown_without_publication(
     tmp_path, monkeypatch
 ):
     config = replace(
@@ -200,6 +210,7 @@ def test_codex_hard_timeout_stops_tree_and_fails_without_artifact(
         codex_timeout_seconds=1,
         codex_idle_timeout_seconds=100,
         codex_model="gpt-test",
+        codex_review_attempts=1,
     )
     config.ensure()
     audio = tmp_path / "external-201-123.mp3"
@@ -231,8 +242,106 @@ def test_codex_hard_timeout_stops_tree_and_fails_without_artifact(
     result = runner.run(audio, log, stderr)
 
     assert result.returncode == 124
+    assert result.quality["automated_review_complete"] is False
+    assert result.quality["review_error"]
+    assert result.quality["quality_status"] == "needs_review"
     assert stopped == [process]
+    assert "متن قبلی" in audio.with_suffix(".md").read_text(encoding="utf-8")
+    assert not (result.evidence_directory / "transcript.md").exists()
     assert "exceeded the 1-second timeout" in result.stderr
     events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    assert events[-1]["stage"] == "error"
-    assert events[-1]["state"] == "failed"
+    assert any(event.get("state") == "warning" for event in events)
+
+
+def test_successful_exit_with_truncated_response_is_not_successful_review(tmp_path, monkeypatch):
+    config = replace(AppConfig.for_root(tmp_path), codex_model="gpt-test")
+    config.ensure()
+    audio = tmp_path / "call.mp3"
+    audio.write_bytes(b"audio")
+    process = HangingProcess()
+    process.returncode = 0
+    def fake_popen(command, **kwargs):
+        Path(command[command.index("--output-last-message") + 1]).write_text('{"segments": [', encoding="utf-8")
+        return process
+    monkeypatch.setattr("callforge.codex_runner.shutil.which", lambda _: "codex")
+    monkeypatch.setattr("callforge.codex_runner.subprocess.Popen", fake_popen)
+    result = CodexRunner(config, FakeLocalPipeline()).run(audio, config.logs / "run.jsonl", config.logs / "run.stderr")
+    assert result.returncode != 0
+    assert result.quality["automated_review_complete"] is False
+    assert result.quality["review_error"]
+    assert not audio.with_suffix(".md").exists()
+    assert len(list(result.evidence_directory.glob("review-attempt-*.json"))) == 2
+    assert (result.evidence_directory / "evidence.json").exists()
+
+
+def test_review_retry_uses_same_asr_and_never_accepts_stale_response(tmp_path, monkeypatch):
+    config = replace(AppConfig.for_root(tmp_path), codex_model="gpt-test")
+    config.ensure()
+    audio = tmp_path / "call.mp3"
+    audio.write_bytes(b"audio")
+    calls = []
+    class CountingPipeline(FakeLocalPipeline):
+        count = 0
+        def prepare(self, *args):
+            self.count += 1
+            return super().prepare(*args)
+    pipeline = CountingPipeline()
+    def fake_popen(command, **kwargs):
+        calls.append(command)
+        output = Path(command[command.index("--output-last-message") + 1])
+        output.write_text(json.dumps({"segments": [{"id": "s1", "text": "سلام", "speaker": "مشتری", "uncertain": False, "notes": ""}]}), encoding="utf-8")
+        process = HangingProcess()
+        process.returncode = 1 if len(calls) == 1 else 0
+        return process
+    monkeypatch.setattr("callforge.codex_runner.shutil.which", lambda _: "codex")
+    monkeypatch.setattr("callforge.codex_runner.subprocess.Popen", fake_popen)
+    result = CodexRunner(config, pipeline).run(audio, config.logs / "run.jsonl", config.logs / "run.stderr")
+    assert result.returncode == 0
+    assert pipeline.count == 1
+    assert len(calls) == 2
+    assert result.quality["automated_review_complete"] is True
+    assert audio.with_suffix(".md").exists()
+
+
+def test_failed_attempt_output_cannot_satisfy_next_empty_attempt(tmp_path, monkeypatch):
+    config = replace(AppConfig.for_root(tmp_path), codex_model="gpt-test")
+    config.ensure()
+    audio = tmp_path / "call.mp3"
+    audio.write_bytes(b"audio")
+    attempts = []
+    def fake_popen(command, **kwargs):
+        attempts.append(command)
+        process = HangingProcess()
+        process.returncode = 1 if len(attempts) == 1 else 0
+        if len(attempts) == 1:
+            Path(command[command.index("--output-last-message") + 1]).write_text(json.dumps({"segments": [
+                {"id": "s1", "text": "سلام", "speaker": "مشتری", "uncertain": False, "notes": ""}]}))
+        return process
+    monkeypatch.setattr("callforge.codex_runner.shutil.which", lambda _: "codex")
+    monkeypatch.setattr("callforge.codex_runner.subprocess.Popen", fake_popen)
+    result = CodexRunner(config, FakeLocalPipeline()).run(audio, config.logs / "run.jsonl", config.logs / "run.stderr")
+    assert result.returncode != 0
+    assert not audio.with_suffix(".md").exists()
+
+
+def test_external_markdown_edit_during_codex_is_preserved(tmp_path, monkeypatch):
+    import pytest
+    from callforge.quality import ArtifactConflictError
+    config = replace(AppConfig.for_root(tmp_path), codex_model="gpt-test")
+    config.ensure()
+    audio = tmp_path / "call.mp3"
+    audio.write_bytes(b"audio")
+    markdown = audio.with_suffix(".md")
+    markdown.write_text("old", encoding="utf-8")
+    process = HangingProcess(); process.returncode = 0
+    def fake_popen(command, **kwargs):
+        markdown.write_text("user external edit", encoding="utf-8")
+        Path(command[command.index("--output-last-message") + 1]).write_text(json.dumps({"segments": [
+            {"id": "s1", "text": "سلام", "speaker": "مشتری", "uncertain": False, "notes": ""}]}), encoding="utf-8")
+        return process
+    monkeypatch.setattr("callforge.codex_runner.shutil.which", lambda _: "codex")
+    monkeypatch.setattr("callforge.codex_runner.subprocess.Popen", fake_popen)
+    with pytest.raises(ArtifactConflictError):
+        CodexRunner(config, FakeLocalPipeline()).run(audio, config.logs / "run.jsonl", config.logs / "run.stderr")
+    assert markdown.read_text() == "user external edit"
+    assert list(config.runs.glob("*/transcript.md"))

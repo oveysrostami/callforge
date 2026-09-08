@@ -18,7 +18,6 @@ if [ ! -x "$ENV_DIR/bin/python" ]; then
 fi
 "$ENV_DIR/bin/python" -m pip install --upgrade pip
 "$ENV_DIR/bin/python" -m pip install --upgrade --force-reinstall "$CALLFORGE_SOURCE"
-"$ENV_DIR/bin/python" -m callforge setup --yes --force-skill
 ln -sfn "$ENV_DIR/bin/callforge" "$BIN_DIR/callforge"
 
 PATH_LINE="export PATH=\"$BIN_DIR:\$PATH\""
@@ -33,4 +32,12 @@ fi
 
 printf '%s\n' "CallForge installed: $BIN_DIR/callforge"
 printf '%s\n' "Open a new terminal once if 'callforge' is not yet on PATH."
+if [ -t 1 ] && [ -r /dev/tty ]; then
+    "$ENV_DIR/bin/python" -m callforge setup --yes --force-skill </dev/tty
+else
+    "$ENV_DIR/bin/python" -m callforge setup --yes --force-skill || {
+        printf '%s\n' "The command is installed. Finish authentication with: $BIN_DIR/callforge setup" >&2
+        exit 1
+    }
+fi
 printf '%s\n' "Next: callforge init /path/to/audio"

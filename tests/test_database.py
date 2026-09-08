@@ -218,8 +218,9 @@ def test_schema_one_is_migrated_without_deleting_database(tmp_path: Path):
         columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(transcripts)")
         }
-    assert version == 4
+    assert version == 5
     assert "audio_content_hash" in columns
+    assert list((tmp_path / "backups").glob("schema-1-*.sqlite3"))
 
 
 def test_schema_two_call_directions_are_migrated_from_filename(tmp_path: Path):
@@ -259,7 +260,7 @@ def test_schema_two_call_directions_are_migrated_from_filename(tmp_path: Path):
         }
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert version == 4
+    assert version == 5
     assert directions == {
         "external-201-09013663769-20260419-193423-id.mp3": "inbound",
         "internal-202-205-20260428-143902-id.mp3": "internal",
@@ -306,6 +307,6 @@ def test_schema_three_migrates_zero_duration_jobs_to_skipped(tmp_path: Path):
         }
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert version == 4
+    assert version == 5
     assert statuses == {"zero.mp3": "skipped", "normal.mp3": "pending"}
     assert foreign_key_errors == []

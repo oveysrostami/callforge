@@ -165,6 +165,29 @@ audio { display: block; width: 100%; height: 42px; }
 .markdown-body a { color: var(--blue); text-decoration: underline; text-underline-offset: 3px; }
 .no-transcript { padding: 45px 20px; text-align: center; color: var(--muted); font-size: 12px; }
 .toast { position: fixed; left: 24px; bottom: 24px; padding: 12px 16px; border-radius: 10px; background: #27312c; color: white; font-size: 12px; box-shadow: var(--shadow); }
+.review-card { padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: white; margin-top: 18px; }
+.review-card h3 { margin-top: 0; }
+.player-card { position: sticky; top: 8px; z-index: 3; background: white; }
+.workspace.review-focus { grid-template-columns: 1fr; overflow: visible; }
+.review-focus .library-panel { display: none; }
+.review-focus .detail-content { max-width: 1000px; margin: auto; }
+.review-focus #review-segments { max-height: none; }
+.toolbar { grid-template-columns: minmax(140px, 1.5fr) repeat(4, minmax(100px, 1fr)); }
+.review-card label { display: block; margin: 10px 0; font-size: 12px; }
+.review-card textarea, .review-card input:not([type=checkbox]), .review-card select { display: block; width: 100%; box-sizing: border-box; padding: 9px; border: 1px solid #a3b4aa; border-radius: 7px; font: inherit; background: white; color: var(--ink); }
+.review-card textarea { resize: vertical; line-height: 1.9; }
+.review-card button { padding: 8px 12px; border: 1px solid #91aa9e; border-radius: 7px; background: #f1f7f4; color: #183c2a; font: inherit; cursor: pointer; }
+.review-card button:disabled { opacity: .5; cursor: wait; }
+.review-card :focus-visible { outline: 3px solid #317aa5; outline-offset: 2px; }
+.review-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.review-controls > label { flex: 1; min-width: 110px; }
+.review-segment { margin: 15px 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; }
+.review-segment.playing { border-color: var(--green); box-shadow: 0 0 0 2px #b6d9c5; }
+.review-flags { color: #875611; font-size: 11px; }
+.review-help, .review-card details { font-size: 12px; line-height: 1.9; overflow-wrap: anywhere; }
+.review-card summary { cursor: pointer; padding: 8px 0; }
+#review-segments { max-height: 680px; overflow: auto; padding: 3px; }
+#review-message { font-size: 12px; color: #7a3b16; }
 
 @media (max-width: 1050px) {
   .workspace { grid-template-columns: 1fr; }

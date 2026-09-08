@@ -96,14 +96,16 @@ def apply_agc(samples: np.ndarray, rate: int, target_rms: float, max_gain: float
     window = max(1, round(rate * 0.25))
     levels = [rms(samples[i : i + window]) for i in range(0, len(samples), window)]
     output = np.zeros_like(samples)
-    softness = 1.4
-    normalizer = math.tanh(softness)
     for index, offset in enumerate(range(0, len(samples), window)):
         chunk = samples[offset : offset + window]
         nearby = levels[max(0, index - 1) : min(len(levels), index + 2)]
         level = max(nearby, default=0.0)
         gain = 1.0 if level <= gate_rms else min(max_gain, max(1.0, target_rms / level))
-        output[offset : offset + len(chunk)] = np.tanh(chunk * gain * softness) / normalizer
+        # Linear peak-limited gain: gain=1 must be an exact no-op, including silence.
+        peak = float(np.max(np.abs(chunk))) if chunk.size else 0.
+        if peak:
+            gain = min(gain, max(1., .95 / peak))
+        output[offset : offset + len(chunk)] = chunk * gain
     return output
 
 
@@ -135,6 +137,10 @@ def main() -> int:
         "duration_seconds": round(len(samples) / rate, 6),
         "peak": round(float(np.max(np.abs(samples))) if samples.size else 0.0, 6),
         "rms": round(rms(samples), 6),
+        "clipping_fraction": float(np.mean(np.abs(samples) >= .999)) if samples.size else 0.,
+        "enhancement_applied": bool(np.any(samples != enhanced)),
+        "enhancement": "linear_peak_limited_agc",
+        "agc_rms": round(rms(enhanced), 6),
         "likely_empty": len(samples) / rate < 1.0 or rms(samples) < 0.0001,
     }
     print(json.dumps(result, ensure_ascii=False))
@@ -147,4 +153,3 @@ if __name__ == "__main__":
     except Exception as error:
         print(f"error: {error}", file=sys.stderr)
         raise SystemExit(1)
-

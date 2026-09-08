@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import os
+import tempfile
+import math
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -10,6 +13,7 @@ from pathlib import Path
 from typing import Iterator
 
 from callforge.metadata import AudioMetadata
+from callforge.quality import file_hash, render_markdown, text_flags
 
 
 MIN_PROCESSABLE_DURATION_SECONDS = 0.5
@@ -110,6 +114,25 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(stage, status, priority DESC, 
 CREATE INDEX IF NOT EXISTS idx_transcripts_current ON transcripts(audio_file_id, is_current);
 CREATE INDEX IF NOT EXISTS idx_runs_audio ON processing_runs(audio_file_id, started_at);
 PRAGMA user_version = 4;
+"""
+
+QUALITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS transcript_reviews (
+    transcript_id INTEGER PRIMARY KEY REFERENCES transcripts(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('needs_review', 'in_review', 'approved')),
+    reviewer TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    data_json TEXT NOT NULL DEFAULT '{}',
+    base_transcript_id INTEGER REFERENCES transcripts(id) ON DELETE SET NULL,
+    markdown_synced INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS run_evidence (
+    processing_run_id INTEGER PRIMARY KEY REFERENCES processing_runs(id) ON DELETE CASCADE,
+    directory TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+PRAGMA user_version = 5;
 """
 
 MIGRATION_1_TO_2 = """
@@ -237,13 +260,23 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > 4:
+            if version > 5:
                 raise RuntimeError(
                     f"Database schema {version} is newer than this CallForge supports"
                 )
+            if 0 < version < 5:
+                backup_directory = self.path.parent / "backups"
+                backup_directory.mkdir(exist_ok=True)
+                descriptor, backup_path = tempfile.mkstemp(prefix=f"schema-{version}-", suffix=".sqlite3", dir=backup_directory)
+                os.close(descriptor)
+                destination = sqlite3.connect(backup_path)
+                try:
+                    connection.backup(destination)
+                finally:
+                    destination.close()
             if version == 0:
                 connection.executescript(SCHEMA)
-                return
+                version = 4
             if version == 1:
                 connection.executescript(MIGRATION_1_TO_2)
                 version = 2
@@ -252,6 +285,7 @@ class Database:
                 version = 3
             if version == 3:
                 connection.executescript(MIGRATION_3_TO_4)
+            connection.executescript(QUALITY_SCHEMA)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -332,7 +366,7 @@ class Database:
                 "SELECT status FROM jobs WHERE audio_file_id=? AND stage='transcribe'",
                 (audio_id,),
             ).fetchone()
-            if job is not None and job["status"] == "skipped":
+            if job is not None and job["status"] in {"skipped", "running"}:
                 return None
             transcript_id, inserted = self._store_transcript(
                 connection, audio_id, None, content, path, language, "existing_markdown"
@@ -353,6 +387,7 @@ class Database:
         markdown_path: Path,
         language: str,
         source: str,
+        force_version: bool = False,
     ) -> tuple[int, bool]:
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         audio_content_hash = str(
@@ -364,7 +399,7 @@ class Database:
             "SELECT id, content_hash FROM transcripts WHERE audio_file_id=? AND is_current=1",
             (audio_id,),
         ).fetchone()
-        if current and current["content_hash"] == content_hash:
+        if current and current["content_hash"] == content_hash and not force_version:
             return int(current["id"]), False
         version = int(
             connection.execute(
@@ -538,6 +573,20 @@ class Database:
             )
             return int(cursor.lastrowid)
 
+    @staticmethod
+    def _store_run_evidence(connection, run_id: int, directory: Path | None) -> None:
+        if directory is None:
+            return
+        payload = {}
+        for path in directory.glob("*.json"):
+            original = path.read_text(encoding="utf-8", errors="replace")
+            try:
+                payload[path.name] = json.loads(original)
+            except json.JSONDecodeError:
+                payload[path.name] = {"invalid_json": True, "original": original}
+        connection.execute("INSERT OR REPLACE INTO run_evidence VALUES (?, ?, ?)",
+                           (run_id, str(directory), json.dumps(payload, ensure_ascii=False)))
+
     def complete_run(
         self,
         job: sqlite3.Row,
@@ -546,7 +595,12 @@ class Database:
         markdown_path: Path,
         language: str,
         codex_thread_id: str | None,
+        quality: dict | None = None,
+        evidence_directory: Path | None = None,
     ) -> int:
+        if quality is not None and (quality.get("automated_review_complete") is False
+                                    or quality.get("speaker_pipeline_complete") is False):
+            raise ValueError("Cannot publish an incomplete automated review")
         with self.transaction() as connection:
             transcript_id, _ = self._store_transcript(
                 connection,
@@ -556,7 +610,13 @@ class Database:
                 markdown_path,
                 language,
                 "codex_skill",
+                force_version=quality is not None,
             )
+            connection.execute(
+                "INSERT OR REPLACE INTO transcript_reviews (transcript_id, status, data_json, markdown_synced, created_at) VALUES (?, 'needs_review', ?, 1, ?)",
+                (transcript_id, json.dumps(quality or {}, ensure_ascii=False), utcnow()),
+            )
+            self._store_run_evidence(connection, run_id, evidence_directory)
             now = utcnow()
             connection.execute(
                 "UPDATE processing_runs SET status='completed', codex_thread_id=?, finished_at=? WHERE id=?",
@@ -569,14 +629,16 @@ class Database:
             )
             return transcript_id
 
-    def fail_run(self, job: sqlite3.Row, run_id: int, error: str) -> None:
+    def fail_run(self, job: sqlite3.Row, run_id: int, error: str, *, retryable: bool = True,
+                 evidence_directory: Path | None = None, codex_thread_id: str | None = None) -> None:
         with self.transaction() as connection:
-            terminal = int(job["attempts"]) >= int(job["max_attempts"])
+            self._store_run_evidence(connection, run_id, evidence_directory)
+            terminal = not retryable or int(job["attempts"]) >= int(job["max_attempts"])
             status = "failed" if terminal else "pending"
             now = utcnow()
             connection.execute(
-                "UPDATE processing_runs SET status='failed', error=?, finished_at=? WHERE id=?",
-                (error, now, run_id),
+                "UPDATE processing_runs SET status='failed', error=?, finished_at=?, codex_thread_id=? WHERE id=?",
+                (error, now, codex_thread_id, run_id),
             )
             connection.execute(
                 "UPDATE jobs SET status=?, claimed_by=NULL, claimed_at=NULL, lease_expires_at=NULL, "
@@ -706,6 +768,7 @@ class Database:
         direction: str = "",
         status: str = "",
         transcript: str = "",
+        review: str = "",
     ) -> tuple[int, list[dict[str, object]]]:
         conditions: list[str] = []
         parameters: list[object] = []
@@ -728,12 +791,16 @@ class Database:
             conditions.append("t.id IS NOT NULL")
         elif transcript == "no":
             conditions.append("t.id IS NULL")
+        if review in {"needs_review", "in_review", "approved"}:
+            conditions.append("t.id IS NOT NULL AND COALESCE(r.status, 'needs_review')=? AND j.status != 'skipped'")
+            parameters.append(review)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         joined = (
             "FROM audio_files a "
             "LEFT JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' "
             "LEFT JOIN transcripts t ON t.audio_file_id=a.id AND t.is_current=1 "
             "AND (j.status IS NULL OR j.status != 'skipped') "
+            "LEFT JOIN transcript_reviews r ON r.transcript_id=t.id "
         )
         with self.connect() as connection:
             total = int(
@@ -753,7 +820,7 @@ class Database:
                 "WHERE history.audio_file_id=a.id AND history.stage='transcribe'), 0) "
                 "AS processing_total_seconds, "
                 "t.id AS transcript_id, t.version AS transcript_version, t.source AS transcript_source, "
-                "t.unclear_count, t.created_at AS transcript_created_at "
+                "t.unclear_count, t.created_at AS transcript_created_at, COALESCE(r.status, 'needs_review') AS review_status "
                 f"{joined} {where} "
                 "ORDER BY (a.recorded_at IS NULL), a.recorded_at DESC, a.id DESC LIMIT ? OFFSET ?",
                 (*parameters, limit, offset),
@@ -791,3 +858,123 @@ class Database:
                 "SELECT absolute_path FROM audio_files WHERE id=?", (audio_id,)
             ).fetchone()
         return Path(row["absolute_path"]) if row else None
+
+    def review_detail(self, audio_id: int) -> dict:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT t.id, t.version, t.source, t.content, t.is_current, t.created_at, "
+                "r.status, r.reviewer, r.notes, r.data_json, r.markdown_synced "
+                "FROM transcripts t LEFT JOIN transcript_reviews r ON r.transcript_id=t.id "
+                "WHERE t.audio_file_id=? ORDER BY t.version DESC", (audio_id,),
+            ).fetchall()
+            current = next((row for row in rows if row["is_current"]), None)
+            return {
+                "transcript_id": current["id"] if current else None,
+                "status": (current["status"] or "needs_review") if current else "needs_review",
+                "reviewer": current["reviewer"] if current else "",
+                "notes": current["notes"] if current else "",
+                "data": json.loads(current["data_json"] or "{}") if current else {},
+                "markdown_synced": bool(current["markdown_synced"]) if current else False,
+                "versions": [{key: row[key] for key in ("id", "version", "source", "content", "created_at", "status", "reviewer", "notes")} for row in rows],
+            }
+
+    def save_review(self, audio_id: int, payload: dict) -> int:
+        """Append a human revision with optimistic locking; publication is recoverable."""
+        status = payload.get("status")
+        reviewer = payload.get("reviewer", "")
+        notes = payload.get("notes", "")
+        if status not in {"in_review", "approved"}:
+            raise ValueError("Invalid review status")
+        if not isinstance(reviewer, str) or not reviewer.strip() or len(reviewer) > 200:
+            raise ValueError("نام بازبین را وارد کنید")
+        if not isinstance(notes, str) or len(notes) > 10000:
+            raise ValueError("Invalid review notes")
+        with self.transaction() as connection:
+            audio = connection.execute("SELECT a.*, j.status AS job_status FROM audio_files a LEFT JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' WHERE a.id=?", (audio_id,)).fetchone()
+            if audio is None:
+                raise ValueError("Audio not found")
+            if audio["job_status"] in {"running", "skipped"}:
+                raise ValueError("بازبینی فایل در حال پردازش یا مدت صفر مجاز نیست")
+            current = connection.execute("SELECT * FROM transcripts WHERE audio_file_id=? AND is_current=1", (audio_id,)).fetchone()
+            if current is None or payload.get("base_transcript_id") != current["id"]:
+                raise ValueError("نسخه تغییر کرده است؛ صفحه را تازه‌سازی کنید و اصلاحات را مقایسه کنید")
+            if file_hash(Path(audio["absolute_path"])) != current["audio_content_hash"]:
+                raise ValueError("فایل صوتی تغییر کرده است؛ ابتدا دوباره scan کنید")
+            previous = connection.execute("SELECT data_json FROM transcript_reviews WHERE transcript_id=?", (current["id"],)).fetchone()
+            data = json.loads(previous[0]) if previous else {}
+            segments = payload.get("segments")
+            if segments is not None:
+                if not isinstance(segments, list) or len(segments) > 10000:
+                    raise ValueError("Invalid segments")
+                checked = []
+                evidence_by_id = {row["id"]: row for row in data.get("segments", [])}
+                seen = set()
+                for index, row in enumerate(segments):
+                    if not isinstance(row, dict):
+                        raise ValueError("Invalid segment")
+                    start, end = row.get("start"), row.get("end")
+                    if type(start) not in {int, float} or type(end) not in {int, float} or not math.isfinite(start + end) or start < 0 or end <= start or end > (audio["duration_seconds"] or 0) + .1:
+                        raise ValueError("زمان بخش خارج از محدودهٔ صوت است")
+                    if not isinstance(row.get("text"), str) or not row["text"].strip() or len(row["text"]) > 20000:
+                        raise ValueError("متن بخش نمی‌تواند خالی باشد")
+                    if not isinstance(row.get("speaker"), str) or not row["speaker"].strip() or len(row["speaker"]) > 200:
+                        raise ValueError("گوینده را مشخص کنید")
+                    identifier = str(row.get("id", f"human-{index}"))
+                    if identifier in seen:
+                        raise ValueError("شناسهٔ بخش تکراری است")
+                    seen.add(identifier)
+                    original = evidence_by_id.get(identifier, {})
+                    checked.append(dict(original, id=identifier, start=float(start), end=float(end),
+                                        text=row["text"].strip(), speaker=row["speaker"].strip(),
+                                        uncertain=bool(row.get("uncertain", False)),
+                                        flags=text_flags(row["text"])))
+                checked.sort(key=lambda row: (row["start"], row["end"]))
+                if status == "approved" and (not checked or set(evidence_by_id) - seen) and not notes.strip():
+                    raise ValueError("برای تأیید متن خالی یا حذف بخش‌های قبلی، توضیح بازبینی لازم است")
+                if status == "approved" and any(row["uncertain"] or "unclear" in row["flags"] for row in checked) and not notes.strip():
+                    raise ValueError("برای تأیید متن دارای ابهام، توضیح بازبینی لازم است")
+                data["segments"] = checked
+                content = render_markdown(audio["filename"], checked, human_reviewed=status == "approved")
+            else:
+                content = payload.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("متن بازبینی نمی‌تواند خالی باشد")
+                # Legacy Markdown can be reviewed without fabricated timestamps.
+                if data.get("segments"):
+                    raise ValueError("برای متن زمان‌بندی‌شده از ویرایش بخش‌ها استفاده کنید")
+                if status == "approved" and "[نامفهوم]" in content and not notes.strip():
+                    raise ValueError("برای تأیید متن دارای ابهام، توضیح بازبینی لازم است")
+            data["quality_status"] = status
+            transcript_id, _ = self._store_transcript(connection, audio_id, None, content,
+                Path(audio["absolute_path"]).with_suffix(".md"), current["language"], "human_review", force_version=True)
+            connection.execute(
+                "INSERT INTO transcript_reviews (transcript_id,status,reviewer,notes,data_json,base_transcript_id,created_at) VALUES (?,?,?,?,?,?,?)",
+                (transcript_id,status,reviewer.strip(),notes,json.dumps(data,ensure_ascii=False),current["id"],utcnow()),
+            )
+        # DB revision survives disk errors; the UI can explicitly retry publication.
+        self.sync_review_markdown(audio_id, transcript_id)
+        return transcript_id
+
+    def sync_review_markdown(self, audio_id: int, transcript_id: int) -> None:
+        with self.transaction() as connection:
+            row = connection.execute("SELECT t.*, r.base_transcript_id FROM transcripts t JOIN transcript_reviews r ON r.transcript_id=t.id WHERE t.id=? AND t.audio_file_id=? AND t.is_current=1", (transcript_id, audio_id)).fetchone()
+            if row is None:
+                raise ValueError("نسخهٔ انتخاب‌شده دیگر نسخهٔ جاری نیست")
+            destination = Path(row["markdown_path"])
+            if destination.exists():
+                allowed = {row["content_hash"]}
+                base = connection.execute("SELECT content_hash FROM transcripts WHERE id=?", (row["base_transcript_id"],)).fetchone()
+                if base:
+                    allowed.add(base[0])
+                if file_hash(destination) not in allowed:
+                    raise ValueError("اصلاح در دیتابیس ذخیره شد اما Markdown بیرون از برنامه تغییر کرده است؛ فایل بیرونی بازنویسی نشد")
+            descriptor, temporary = tempfile.mkstemp(prefix=".callforge-review-", suffix=".md", dir=destination.parent)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(row["content"])
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, destination)
+                connection.execute("UPDATE transcript_reviews SET markdown_synced=1 WHERE transcript_id=?", (transcript_id,))
+            finally:
+                Path(temporary).unlink(missing_ok=True)

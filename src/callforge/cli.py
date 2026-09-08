@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -10,9 +11,10 @@ from callforge.config import AppConfig
 from callforge.db import Database
 from callforge.registry import get_active_root, set_active_root
 from callforge.scanner import scan
-from callforge.setup_tools import checks, setup
+from callforge.setup_tools import checks, setup, speaker_check
 from callforge.worker import run_batch
 from callforge.web import serve_ui
+from callforge.evaluation import sample_calls, score, transcript_text
 
 
 def positive_int(value: str) -> int:
@@ -167,6 +169,162 @@ def command_ui(args) -> int:
     return 0
 
 
+def command_evaluation_sample(args) -> int:
+    _, database = workspace()
+    with database.connect() as connection:
+        rows = [dict(row) for row in connection.execute(
+            "SELECT a.id, a.filename, a.relative_path, a.duration_seconds, a.direction, a.content_sha256 "
+            "FROM audio_files a JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' "
+            "WHERE j.status != 'skipped' AND a.duration_seconds >= 0.5 ORDER BY a.id")]
+    value = {"schema_version": 1, "seed": args.seed,
+             "instructions": "Review these calls in the UI. Only approve after listening. Keep holdout calls out of prompt/model tuning.",
+             "calls": sample_calls(rows, args.count, args.seed)}
+    # Never silently overwrite an existing evaluation selection.
+    with Path(args.output).expanduser().open("x", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+    print(f"Selected {len(value['calls'])} calls for human review: {args.output}")
+    return 0
+
+
+def command_evaluate(args) -> int:
+    _, database = workspace()
+    selection = json.loads(Path(args.sample).expanduser().read_text(encoding="utf-8")) if args.sample else None
+    selected = {row["id"]: row for row in selection["calls"]} if selection else None
+    results, excluded = [], []
+    with database.connect() as connection:
+        references = connection.execute(
+            "SELECT t.*, r.data_json FROM transcripts t JOIN transcript_reviews r ON r.transcript_id=t.id "
+            "JOIN jobs j ON j.audio_file_id=t.audio_file_id AND j.stage='transcribe' "
+            "WHERE t.is_current=1 AND r.status='approved' AND j.status != 'skipped'").fetchall()
+        for reference in references:
+            audio_id = reference["audio_file_id"]
+            if selected is not None and audio_id not in selected:
+                continue
+            if selected is not None and selected[audio_id]["content_sha256"] != reference["audio_content_hash"]:
+                excluded.append({"audio_id": audio_id, "reason": "audio hash changed"}); continue
+            baseline = connection.execute(
+                "SELECT t.*, r.data_json FROM transcripts t LEFT JOIN transcript_reviews r ON r.transcript_id=t.id "
+                "WHERE t.audio_file_id=? AND t.version<? AND t.source='codex_skill' AND t.audio_content_hash=? "
+                "ORDER BY t.version DESC LIMIT 1", (audio_id, reference["version"], reference["audio_content_hash"])).fetchone()
+            if baseline is None:
+                excluded.append({"audio_id": audio_id, "reason": "no machine baseline"}); continue
+            reference_text = transcript_text(reference["content"], json.loads(reference["data_json"] or "{}"))
+            baseline_text = transcript_text(baseline["content"], json.loads(baseline["data_json"] or "{}"))
+            results.append({"audio_id": audio_id, "reference_transcript_id": reference["id"],
+                            "baseline_transcript_id": baseline["id"], "audio_sha256": reference["audio_content_hash"],
+                            "split": selected[audio_id]["evaluation_split"] if selected else "unspecified",
+                            **score(reference_text, baseline_text)})
+    words = sum(row["reference_words"] for row in results)
+    chars = sum(row["reference_characters"] for row in results)
+    report = {"evaluated_calls": len(results), "wer": sum(row["word_errors"] for row in results) / words if words else None,
+              "cer": sum(row["character_errors"] for row in results) / chars if chars else None,
+              "calls": results, "excluded": excluded,
+              "note": "Error rates compare machine text to explicitly human-approved versions; they are not model confidence. No speaker DER is claimed."}
+    report["by_split"] = {}
+    for split in sorted({row["split"] for row in results}):
+        group = [row for row in results if row["split"] == split]
+        group_words = sum(row["reference_words"] for row in group)
+        group_chars = sum(row["reference_characters"] for row in group)
+        report["by_split"][split] = {"calls": len(group),
+            "wer": sum(row["word_errors"] for row in group) / group_words if group_words else None,
+            "cer": sum(row["character_errors"] for row in group) / group_chars if group_chars else None}
+    if selected is not None:
+        report["selected_calls"] = len(selected)
+        report["not_evaluated_audio_ids"] = sorted(set(selected) - {row["audio_id"] for row in results})
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_benchmark_freeze(args) -> int:
+    from callforge.benchmark import freeze_reference
+    config, database = workspace()
+    directory = config.workspace / "benchmarks"
+    directory.mkdir(exist_ok=True)
+    output = Path(args.output).expanduser().resolve() if args.output else directory / f"audio-{args.audio_id}.json"
+    value = freeze_reference(database, args.audio_id, output)
+    print(json.dumps({"benchmark": str(output), "reference_version": value["reference"]["version"],
+                      "text": value["baseline_text_score"], "speaker": value["baseline_speaker_score"]}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_benchmark_diarization(args) -> int:
+    from callforge.benchmark import run_speaker_experiment
+    from datetime import UTC, datetime
+    config, _ = workspace()
+    benchmark = Path(args.benchmark).expanduser().resolve()
+    output = (Path(args.output).expanduser().resolve() if args.output else
+              config.workspace / "experiments" / datetime.now(UTC).strftime("speakers-%Y%m%dT%H%M%S%fZ"))
+    print(f"Isolated speaker experiment: {output}", flush=True)
+    report = run_speaker_experiment(config, benchmark, output, timeout=args.timeout)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["status"] == "completed" else 1
+
+
+def command_benchmark_roles(args) -> int:
+    from callforge.benchmark import run_role_experiment
+    from datetime import UTC, datetime
+    config = AppConfig.for_root(get_active_root())  # No DB initialization or writes for experiments.
+    output = (Path(args.output).expanduser().resolve() if args.output else
+              config.workspace / "experiments" / ("roles-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")))
+    report = run_role_experiment(config, Path(args.benchmark).expanduser().resolve(),
+                                 Path(args.diarization).expanduser().resolve(), output, timeout=args.timeout,
+                                 alignment_directory=Path(args.alignment).expanduser().resolve() if args.alignment else None)
+    print(json.dumps({"output": str(output), **report}, ensure_ascii=False, indent=2))
+    return 0 if report["status"] == "completed" else 1
+
+
+def command_setup_alignment(args) -> int:
+    from callforge.alignment_experiment import setup_alignment_runtime
+    config = AppConfig.for_root(get_active_root())
+    setup_alignment_runtime(config)
+    print("Alignment dependencies ready in isolated speaker runtime; normal transcription settings unchanged.")
+    return 0
+
+
+def command_benchmark_alignment(args) -> int:
+    from callforge.alignment_experiment import run_alignment_experiment
+    from datetime import UTC, datetime
+    config = AppConfig.for_root(get_active_root())
+    output = (Path(args.output).expanduser().resolve() if args.output else config.workspace / "experiments" /
+              ("alignment-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")))
+    print(f"Local word alignment experiment: {output}", flush=True)
+    report = run_alignment_experiment(config, Path(args.benchmark).expanduser().resolve(),
+                                      Path(args.diarization).expanduser().resolve(), output, timeout=args.timeout, backend=args.backend)
+    print(json.dumps({key: value for key, value in report.items() if key != "runtime"}, ensure_ascii=False, indent=2))
+    return 0 if report["status"] == "completed" else 1
+
+
+def command_hf_login(args) -> int:
+    import subprocess
+    from callforge.speaker_runtime import environment, python
+    if not sys.stdin.isatty():
+        raise ValueError("Run callforge hf-login in your own interactive terminal; do not pass tokens as command arguments")
+    # A fresh process ensures the Hub reads this workspace's HF_HOME before import.
+    # Hugging Face's own masked prompt verifies and stores the token, never in git.
+    interpreter = python()
+    if not interpreter.is_file():
+        raise ValueError("Run callforge setup first")
+    return subprocess.run([str(interpreter), "-m", "callforge.hf_auth"],
+                          env=environment(), check=False).returncode
+
+
+def command_setup(args) -> int:
+    install = args.yes and not args.check
+    if not args.check and not install:
+        if not sys.stdin.isatty():
+            raise ValueError("Use callforge setup --yes to install, or --check for a read-only check. Tokens require an interactive terminal.")
+        install = input("Install dependencies and download local Whisper/speaker models? [Y/n]: ").strip().lower() not in {"n", "no"}
+    return 0 if print_checks(setup(install, args.force_skill)) else 1
+
+
+def command_setup_diarization(args) -> int:
+    from callforge.benchmark import setup_speaker_runtime
+    config, _ = workspace()
+    setup_speaker_runtime(config)
+    print("Isolated speaker runtime is ready. Whisper and normal transcription settings were not changed.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="callforge")
     parser.add_argument("--version", action="version", version=__version__)
@@ -175,10 +333,12 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser = subparsers.add_parser("setup", help="Check and install runtime dependencies")
     setup_parser.add_argument("--yes", action="store_true", help="Install missing components")
     setup_parser.add_argument("--force-skill", action="store_true", help="Back up and replace the installed skill")
-    setup_parser.set_defaults(func=lambda args: 0 if print_checks(setup(args.yes, args.force_skill)) else 1)
+    setup_parser.add_argument("--diarization", action="store_true", help="Compatibility option: speaker models are now included by default")
+    setup_parser.add_argument("--check", action="store_true", help="Read-only readiness check; no installation or login")
+    setup_parser.set_defaults(func=command_setup)
 
     doctor = subparsers.add_parser("doctor", help="Check the local runtime")
-    doctor.set_defaults(func=lambda args: 0 if print_checks(checks()) else 1)
+    doctor.set_defaults(func=lambda args: 0 if print_checks(checks() + [speaker_check()]) else 1)
 
     init = subparsers.add_parser("init", help="Initialize and index an audio directory")
     init.add_argument("directory")
@@ -200,6 +360,45 @@ def build_parser() -> argparse.ArgumentParser:
 
     current = subparsers.add_parser("workspace", help="Show the active audio directory and database")
     current.set_defaults(func=command_workspace)
+
+    sample = subparsers.add_parser("evaluation-sample", help="Select a local stratified human-review benchmark")
+    sample.add_argument("--count", type=positive_int, default=40)
+    sample.add_argument("--seed", type=int, default=42)
+    sample.add_argument("--output", required=True)
+    sample.set_defaults(func=command_evaluation_sample)
+    evaluate = subparsers.add_parser("evaluate", help="Measure machine WER/CER against human-approved revisions")
+    evaluate.add_argument("--sample", help="Optional frozen evaluation selection JSON")
+    evaluate.set_defaults(func=command_evaluate)
+
+    freeze = subparsers.add_parser("benchmark-freeze", help="Freeze one current human-approved reference and its machine baseline")
+    freeze.add_argument("--audio-id", required=True, type=positive_int)
+    freeze.add_argument("--output", help="New JSON path; defaults to the active workspace benchmarks folder")
+    freeze.set_defaults(func=command_benchmark_freeze)
+    speakers = subparsers.add_parser("benchmark-diarization", help="Run local speaker detection only, without publishing any transcript")
+    speakers.add_argument("--benchmark", required=True)
+    speakers.add_argument("--output", help="New experiment directory; existing directories are never overwritten")
+    speakers.add_argument("--timeout", type=positive_int, default=300)
+    speakers.set_defaults(func=command_benchmark_diarization)
+    roles = subparsers.add_parser("benchmark-roles", help="Infer roles from machine text and existing acoustic evidence; never publish")
+    roles.add_argument("--benchmark", required=True)
+    roles.add_argument("--diarization", required=True, help="Directory of a completed matching benchmark-diarization run")
+    roles.add_argument("--alignment", help="Optional completed benchmark-alignment directory; enables word-local refinement")
+    roles.add_argument("--output", help="New experiment directory; existing directories are never overwritten")
+    roles.add_argument("--timeout", type=positive_int, default=180)
+    roles.set_defaults(func=command_benchmark_roles)
+    alignment_setup = subparsers.add_parser("setup-alignment", help="Install experimental alignment dependencies in isolated runtime")
+    alignment_setup.set_defaults(func=command_setup_alignment)
+    alignment = subparsers.add_parser("benchmark-alignment", help="Align ambiguous machine-text words locally without publishing")
+    alignment.add_argument("--benchmark", required=True)
+    alignment.add_argument("--diarization", required=True)
+    alignment.add_argument("--output")
+    alignment.add_argument("--timeout", type=positive_int, default=600)
+    alignment.add_argument("--backend", choices=("ctc", "mlx"), default="ctc", help="mlx uses only cached Whisper on Apple Silicon, without downloading")
+    alignment.set_defaults(func=command_benchmark_alignment)
+    login = subparsers.add_parser("hf-login", help="Secure interactive Hugging Face login for the active workspace model cache")
+    login.set_defaults(func=command_hf_login)
+    speaker_setup = subparsers.add_parser("setup-diarization", help="Install the experimental speaker detector in a separate runtime")
+    speaker_setup.set_defaults(func=command_setup_diarization)
 
     retry = subparsers.add_parser("retry", help="Requeue terminal failures")
     retry.set_defaults(func=command_retry)

@@ -57,7 +57,7 @@ def describe_codex_event(event: dict[str, Any]) -> dict[str, str] | None:
         return {
             "stage": "finalize",
             "state": "completed",
-            "message": "اجرای Codex پایان یافت؛ نتیجه در حال ثبت است",
+            "message": "این مرحلهٔ Codex پایان یافت؛ پردازش CallForge ادامه دارد",
         }
 
     item = event.get("item")
@@ -67,6 +67,14 @@ def describe_codex_event(event: dict[str, Any]) -> dict[str, str] | None:
     item_status = str(item.get("status") or "")
 
     if item_type == "agent_message":
+        try:
+            response = json.loads(str(item.get("text") or ""))
+        except json.JSONDecodeError:
+            response = None
+        if isinstance(response, dict) and isinstance(response.get("segments"), list):
+            return {"stage": "finalize", "state": "active", "message": "پاسخ ساخت‌یافتهٔ بازبینی دریافت شد؛ در حال اعتبارسنجی و ثبت نتیجه"}
+        if isinstance(response, dict) and isinstance(response.get("roles"), list):
+            return {"stage": "speaker_roles", "state": "active", "message": "نقش‌های پیشنهادی دریافت شد؛ در حال بررسی شواهد هر گوینده"}
         message = _compact(item.get("text"))
         if not message:
             return None
@@ -116,5 +124,5 @@ def read_progress_events(
             continue
         event = describe_codex_event(raw)
         if event:
-            described.append({"line": index, **event})
+            described.append({"line": index, **event, **({"timestamp": raw["timestamp"]} if isinstance(raw.get("timestamp"), str) else {})})
     return len(lines), described[-maximum:]

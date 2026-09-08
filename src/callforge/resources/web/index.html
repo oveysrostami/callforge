@@ -61,6 +61,15 @@
                 <option value="no">بدون متن</option>
               </select>
             </label>
+            <label>
+              <span class="sr-only">وضعیت بازبینی انسانی</span>
+              <select id="review-filter">
+                <option value="">همهٔ بازبینی‌ها</option>
+                <option value="needs_review">نیازمند بازبینی انسانی</option>
+                <option value="in_review">در حال بازبینی</option>
+                <option value="approved">تأیید انسانی</option>
+              </select>
+            </label>
           </div>
 
           <div class="result-heading">
@@ -148,6 +157,31 @@
               </div>
               <article class="markdown-body" id="transcript" dir="rtl"></article>
               <div class="no-transcript hidden" id="no-transcript">هنوز متنی برای این فایل ثبت نشده است.</div>
+            </section>
+            <section class="review-card hidden" id="review-card" aria-labelledby="review-heading">
+              <h3 id="review-heading">کارگاه بازبینی انسانی</h3>
+              <button id="review-focus" type="button">نمای متمرکز بازبینی</button>
+              <p id="review-state" role="status"></p>
+              <p class="review-help">با زدن زمان هر بخش، همان قسمت پخش می‌شود. برچسب‌های هشدار احتمال خطا هستند، نه امتیاز دقت. متن خام و تقویت‌شده برای مقایسه در دسترس‌اند.</p>
+              <div class="review-controls">
+                <label>سرعت پخش <select id="review-speed"><option value="0.75">۰٫۷۵×</option><option value="1" selected>۱×</option><option value="1.25">۱٫۲۵×</option><option value="1.5">۱٫۵×</option></select></label>
+                <label><input type="checkbox" id="review-only-flags"> فقط بخش‌های نیازمند توجه</label>
+              </div>
+              <div id="review-segments"></div>
+              <label id="review-legacy-label" class="hidden">ویرایش Markdown قدیمی (بدون زمان‌بندی)
+                <textarea id="review-legacy" rows="12"></textarea>
+              </label>
+              <button id="review-add" type="button">افزودن بخش در زمان پخش</button>
+              <label>نام بازبین <input id="reviewer" maxlength="200" autocomplete="name"></label>
+              <label>یادداشت بازبینی <textarea id="review-notes" rows="2" maxlength="10000"></textarea></label>
+              <div class="review-controls">
+                <button id="review-save" type="button">ذخیرهٔ اصلاحات</button>
+                <button id="review-approve" type="button">ثبت تأیید انسانی</button>
+                <button id="review-sync" type="button">همگام‌سازی Markdown</button>
+                <button id="review-reload" type="button">بازخوانی نسخهٔ ذخیره‌شده</button>
+              </div>
+              <p id="review-message" role="status" aria-live="polite"></p>
+              <details><summary>نسخه‌ها و تاریخچهٔ بازبینی</summary><div id="review-history"></div></details>
             </section>
           </div>
         </aside>

@@ -26,9 +26,6 @@ if ($LASTEXITCODE -ne 0) { throw "Could not update pip." }
 & $EnvironmentPython -m pip install --upgrade --force-reinstall $Source
 if ($LASTEXITCODE -ne 0) { throw "CallForge installation failed." }
 
-& $EnvironmentPython -m callforge setup --yes --force-skill
-if ($LASTEXITCODE -ne 0) { throw "CallForge runtime setup did not complete." }
-
 $ScriptsDirectory = Join-Path $EnvironmentDirectory "Scripts"
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $PathEntries = @($UserPath -split ";" | Where-Object { $_ })
@@ -40,4 +37,6 @@ $env:Path = "$ScriptsDirectory;$env:Path"
 
 Write-Output "CallForge installed: $(Join-Path $ScriptsDirectory 'callforge.exe')"
 Write-Output "The command is available in this PowerShell session and future terminals."
+& $EnvironmentPython -m callforge setup --yes --force-skill
+if ($LASTEXITCODE -ne 0) { throw "The command is installed. Finish authentication with: callforge setup" }
 Write-Output "Next: callforge init C:\path\to\audio"

@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from callforge.config import AppConfig
+from callforge.quality import build_evidence, retry_priority, write_json
 
 
 @dataclass(frozen=True)
@@ -22,7 +25,7 @@ class LocalWhisperPipeline:
     def __init__(self, config: AppConfig, skill_directory: Path | None = None):
         self.config = config
         self.skill_directory = skill_directory or (
-            Path.home() / ".agents" / "skills" / self.config.skill_name
+            Path(__file__).parent / "resources" / self.config.skill_name
         )
 
     def _event(
@@ -37,6 +40,7 @@ class LocalWhisperPipeline:
             "stage": stage,
             "state": state,
             "message": message,
+            "timestamp": datetime.now(UTC).isoformat(),
         }
         with log_path.open("a", encoding="utf-8", buffering=1) as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -56,7 +60,9 @@ class LocalWhisperPipeline:
         destination: Path,
         stderr_path: Path,
         label: str,
+        timeout: float | None = None,
     ) -> dict:
+        started = time.monotonic()
         try:
             completed = subprocess.run(
                 command,
@@ -64,7 +70,7 @@ class LocalWhisperPipeline:
                 env=self.config.runtime_environment(),
                 capture_output=True,
                 text=True,
-                timeout=self.config.whisper_timeout_seconds,
+                timeout=timeout or self.config.whisper_timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
             self._append_stderr(stderr_path, label, str(exc))
@@ -79,6 +85,9 @@ class LocalWhisperPipeline:
             parsed = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"{label} returned invalid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"{label} returned an invalid result object")
+        parsed["elapsed_seconds"] = round(time.monotonic() - started, 3)
         destination.write_text(
             json.dumps(parsed, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -158,15 +167,16 @@ class LocalWhisperPipeline:
             "active",
             "اجرای پاس اول Whisper روی صدای خام",
         )
-        self._run_json(
+        raw_result = self._run_json(
             [
                 sys.executable,
                 str(transcribe_script),
                 str(raw_wav),
                 "--model",
-                "turbo",
+                self.config.whisper_model,
                 "--language",
                 self.config.language,
+                "--prompt", "، ".join(self.config.glossary),
             ],
             raw_transcript_path,
             stderr_path,
@@ -186,15 +196,16 @@ class LocalWhisperPipeline:
             "active",
             "اجرای پاس دوم Whisper روی صدای تقویت‌شده",
         )
-        self._run_json(
+        enhanced_result = self._run_json(
             [
                 sys.executable,
                 str(transcribe_script),
                 str(agc_wav),
                 "--model",
-                "turbo",
+                self.config.whisper_model,
                 "--language",
                 self.config.language,
+                "--prompt", "، ".join(self.config.glossary),
             ],
             agc_transcript_path,
             stderr_path,
@@ -204,8 +215,33 @@ class LocalWhisperPipeline:
             log_path,
             "whisper",
             "completed",
-            "دو پاس مستقل Whisper کامل شد",
+            "دو پاس Whisper کامل شد؛ بررسی اختلاف‌ها و بخش‌های مشکوک",
         )
+        evidence = build_evidence(raw_result, enhanced_result, float(metadata.get("duration_seconds", 0)),
+                                  raw_result.get("speech_regions"))
+        deadline = time.monotonic() + self.config.whisper_retry_seconds
+        candidates = [row for row in evidence["segments"] if set(row["flags"]) & {
+            "repetition", "compression", "pass_disagreement", "speech_gap", "low_logprob"}]
+        candidates.sort(key=retry_priority)
+        for index, row in enumerate(candidates[:self.config.whisper_retry_segments]):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._event(log_path, "whisper_retry", "active", f"بازخوانی محدود بخش مشکوک {index + 1}: {row['start']:.1f} تا {row['end']:.1f} ثانیه")
+            try:
+                retry = self._run_json([
+                    sys.executable, str(transcribe_script), str(agc_wav),
+                    "--model", self.config.whisper_retry_model,
+                    "--language", self.config.language, "--prompt", "، ".join(self.config.glossary),
+                    "--start", str(max(0, row["start"] - 1)),
+                    "--end", str(min(evidence["duration_seconds"], row["end"] + 1)),
+                ], work_directory / f"retry-{row['id']}.json", stderr_path, "Whisper selective retry", timeout=remaining)
+                row["retry"] = retry
+            except RuntimeError as exc:
+                row["retry_error"] = str(exc)
+                self._event(log_path, "whisper_retry", "warning", "بازخوانی تکمیلی کامل نشد؛ بخش برای بازبینی انسانی علامت‌گذاری شد")
+        # Speaker inference runs after text review, in its isolated runtime.
+        write_json(work_directory / "evidence.json", evidence)
         return PreparedTranscription(
             metadata_path=metadata_path,
             raw_transcript_path=raw_transcript_path,

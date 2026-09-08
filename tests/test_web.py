@@ -35,6 +35,35 @@ def get_json(url: str):
         return response.status, json.loads(response.read())
 
 
+def test_human_review_http_roundtrip_history_and_filter(tmp_path):
+    server, thread, audio_id = prepared_server(tmp_path)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        _, review = get_json(f"{base}/api/files/{audio_id}/review")
+        assert review["status"] == "needs_review"
+        payload = {"base_transcript_id": review["transcript_id"], "content": "## مکالمه\n\n**مشتری:** سلام وقت بخیر",
+                   "status": "approved", "reviewer": "test", "notes": "fixture only"}
+        request = Request(f"{base}/api/files/{audio_id}/review", data=json.dumps(payload).encode(),
+                          headers={"Content-Type": "application/json", "X-CallForge-UI": "1"})
+        with urlopen(request, timeout=3) as response:
+            saved = json.loads(response.read())
+        assert saved["status"] == "approved"
+        assert saved["markdown_synced"] is True
+        assert len(saved["versions"]) == 2
+        _, listing = get_json(f"{base}/api/files?review=approved")
+        assert listing["total"] == 1
+        assert listing["items"][0]["review_status"] == "approved"
+        _, listing = get_json(f"{base}/api/files?review=needs_review")
+        assert listing["total"] == 0
+        try:
+            urlopen(request, timeout=3)
+            assert False, "stale revision must be rejected"
+        except HTTPError as error:
+            assert error.code == 409
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=3)
+
+
 def test_ui_api_lists_details_and_streams_range(tmp_path: Path):
     server, thread, audio_id = prepared_server(tmp_path)
     base = f"http://127.0.0.1:{server.server_address[1]}"

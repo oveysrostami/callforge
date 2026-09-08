@@ -10,6 +10,11 @@ const state = {
   progressRunId: null,
   progressSnapshot: null,
   progressSeen: new Set(),
+  reviewDirty: false,
+  reviewSaving: false,
+  reviewRows: [],
+  reviewBase: null,
+  reviewAudioId: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -246,6 +251,7 @@ function queryString() {
     direction: $("direction").value,
     status: $("status").value,
     transcript: $("transcript-filter").value,
+    review: $("review-filter").value,
   };
   Object.entries(values).forEach(([key, value]) => { if (value) params.set(key, value); });
   return params.toString();
@@ -276,6 +282,11 @@ function renderRows(items) {
     processing.textContent = item.latest_run_id ? duration(Number(item.processing_total_seconds || 0)) : "—";
     const status = document.createElement("td");
     status.append(badge(item.job_status));
+    if (item.transcript_id) {
+      const quality = document.createElement("span"); quality.className = "file-secondary";
+      quality.textContent = qualityLabels[item.review_status] || "نیازمند بازبینی انسانی";
+      status.append(quality);
+    }
     row.append(call, time, length, processing, status);
     row.addEventListener("click", () => selectFile(item.id));
     row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectFile(item.id); });
@@ -385,7 +396,7 @@ function appendProgressEvent(progress) {
   const message = document.createElement("span");
   const time = document.createElement("time");
   message.textContent = progress.message || "رویداد جدید پردازش";
-  time.textContent = progressTime();
+  time.textContent = progress.timestamp ? dateTime(progress.timestamp) : "زمان رویداد ثبت نشده";
   item.append(message, time);
   const events = $("progress-events");
   events.prepend(item);
@@ -455,6 +466,9 @@ function updateTranscribeButton(item) {
 }
 
 async function selectFile(id, reloadAudio = true) {
+  if (state.reviewSaving && state.selectedId !== id) { showToast("ذخیرهٔ بازبینی در حال انجام است."); return; }
+  if (state.reviewDirty && state.selectedId !== id && !window.confirm("اصلاحات ذخیره نشده‌اند. از این فایل خارج می‌شوید؟")) return;
+  if (state.selectedId !== id) state.reviewDirty = false;
   state.selectedId = id;
   document.querySelectorAll("tbody tr").forEach((row) => row.classList.toggle("selected", Number(row.dataset.id) === id));
   try {
@@ -470,6 +484,7 @@ async function selectFile(id, reloadAudio = true) {
     status.className = `status-badge status-${item.job_status || "unknown"}`;
     status.textContent = statusLabels[item.job_status] || "نامشخص";
     if (reloadAudio) {
+      playbackEnd = null;
       const player = $("audio-player");
       player.pause();
       player.src = item.audio_url;
@@ -497,6 +512,7 @@ async function selectFile(id, reloadAudio = true) {
     $("no-transcript").classList.toggle("hidden", hasTranscript);
     renderMarkdown($("transcript"), item.transcript_content || "");
     $("transcript-version").textContent = hasTranscript ? `نسخه ${faNumber(item.transcript_version)} · ${dateTime(item.transcript_created_at)}` : "";
+    if (!state.reviewDirty) renderReview(item);
   } catch (error) {
     showToast(error.message);
   }
@@ -505,6 +521,8 @@ async function selectFile(id, reloadAudio = true) {
 async function transcribeSelected() {
   const item = state.selectedItem;
   if (!item) return;
+  if (state.reviewSaving) { showToast("ذخیرهٔ بازبینی در حال انجام است."); return; }
+  if (state.reviewDirty) { showToast("ابتدا اصلاحات بازبینی را ذخیره کنید."); return; }
   if (item.transcript_id) {
     const confirmed = window.confirm("متن فعلی حفظ می‌شود و پس از موفقیت، نسخهٔ جدید جایگزین نسخهٔ جاری خواهد شد. ادامه می‌دهید؟");
     if (!confirmed) return;
@@ -523,6 +541,175 @@ async function transcribeSelected() {
   }
 }
 
+const qualityLabels = { needs_review: "نیازمند بازبینی انسانی", in_review: "در حال بازبینی انسانی", approved: "تأییدشده توسط انسان" };
+const flagLabels = { repetition: "تکرار مشکوک", compression: "تکرار/فشردگی متن", pass_disagreement: "اختلاف دو پاس", speech_gap: "احتمال گفتار حذف‌شده", verify_numbers: "بررسی عدد", unsupported_number: "عدد بدون پشتوانه", unclear: "نامفهوم", low_logprob: "خروجی ضعیف مدل", possible_non_speech: "احتمال سکوت", large_revision: "تغییر عمده", uncertain_wording: "عبارت نامطمئن" };
+Object.assign(flagLabels, { speaker_uncertain: "صدای نامطمئن", speaker_overlap: "هم‌پوشانی صداها", word_aligned: "تطبیق کلمات با صدا", boundary_review_required: "مرز گفتار نیازمند بازبینی", mixed_speakers: "چند گوینده در یک بخش" });
+let playbackEnd = null;
+
+function reviewDirty() {
+  state.reviewDirty = true;
+  $("review-message").textContent = "اصلاحات ذخیره نشده‌اند";
+}
+
+function reviewField(label, tag, value, onChange) {
+  const wrapper = document.createElement("label");
+  wrapper.append(document.createTextNode(label));
+  const input = document.createElement(tag);
+  input.value = value ?? "";
+  input.addEventListener("input", () => { onChange(input.value); reviewDirty(); });
+  wrapper.append(input);
+  return { wrapper, input };
+}
+
+function renderReviewRows() {
+  const container = $("review-segments");
+  container.replaceChildren();
+  for (const row of state.reviewRows) {
+    if ($("review-only-flags").checked && !(row.flags?.length || row.uncertain)) continue;
+    const card = document.createElement("section");
+    card.className = "review-segment";
+    card.dataset.segmentId = row.id;
+    const play = document.createElement("button");
+    play.type = "button";
+    play.textContent = `▶ ${duration(row.start)} تا ${duration(row.end)}`;
+    play.addEventListener("click", () => {
+      const player = $("audio-player");
+      player.currentTime = row.start;
+      playbackEnd = row.end;
+      player.play().catch((error) => showToast(error.message));
+    });
+    card.append(play);
+    const flags = document.createElement("p");
+    flags.className = "review-flags";
+    flags.textContent = (row.flags || []).map((flag) => flagLabels[flag] || flag).join(" · ");
+    card.append(flags);
+    const times = document.createElement("div"); times.className = "review-controls";
+    for (const [key, label] of [["start", "شروع (ثانیه)"], ["end", "پایان (ثانیه)"]]) {
+      const field = reviewField(label, "input", row[key], (value) => { row[key] = Number(value); });
+      field.input.type = "number"; field.input.min = "0"; field.input.step = "0.01";
+      times.append(field.wrapper);
+    }
+    card.append(times);
+    card.append(reviewField("گوینده / نقش", "input", row.speaker, (value) => { row.speaker = value; }).wrapper);
+    const text = reviewField("متن اصلاح‌شده", "textarea", row.text, (value) => { row.text = value; });
+    text.input.rows = 3; card.append(text.wrapper);
+    const uncertain = document.createElement("label");
+    const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.checked = Boolean(row.uncertain);
+    checkbox.addEventListener("change", () => { row.uncertain = checkbox.checked; reviewDirty(); });
+    uncertain.append(checkbox, document.createTextNode(" هنوز ابهام دارد")); card.append(uncertain);
+    const evidence = document.createElement("details");
+    const summary = document.createElement("summary"); summary.textContent = "مقایسه با شواهد و یادداشت مدل";
+    evidence.append(summary);
+    for (const [label, value] of [["شناسهٔ صوتی گوینده (نه نقش فرد)", row.speaker_id], ["صدای خام", row.raw_text ?? row.text], ["صدای تقویت‌شده", row.alternative], ["بازخوانی تکمیلی", row.retry?.text], ["یادداشت", row.notes]]) {
+      if (!value) continue;
+      const paragraph = document.createElement("p"); paragraph.textContent = `${label}: ${value}`; evidence.append(paragraph);
+    }
+    const role = state.selectedItem?.review?.data?.speaker_pipeline?.roles?.find((item) => item.speaker_id === row.speaker_id);
+    if (role) {
+      const note = document.createElement("p");
+      note.textContent = `دلیل نقش پیشنهادی: ${role.reason} — ${(role.evidence || []).map((item) => item.quote).join(" / ")}`;
+      evidence.append(note);
+    }
+    card.append(evidence);
+    const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "حذف این بخش";
+    remove.addEventListener("click", () => {
+      if (!window.confirm("این بخش از نسخهٔ اصلاح‌شده حذف شود؟ شواهد اجرای اولیه باقی می‌ماند.")) return;
+      state.reviewRows = state.reviewRows.filter((item) => item !== row); reviewDirty(); renderReviewRows();
+    });
+    card.append(remove); container.append(card);
+  }
+}
+
+function renderReview(item) {
+  const review = item.review || {};
+  const visible = Boolean(item.transcript_id) && !["skipped", "running"].includes(item.job_status);
+  $("review-card").classList.toggle("hidden", !visible);
+  if (!visible) return;
+  state.reviewAudioId = item.id;
+  state.reviewBase = review.transcript_id;
+  state.reviewRows = structuredClone(review.data?.segments || []);
+  state.reviewTimed = Array.isArray(review.data?.segments);
+  $("review-state").textContent = qualityLabels[review.status] || qualityLabels.needs_review;
+  $("reviewer").value = review.reviewer || localStorage.getItem("callforge-reviewer") || "";
+  $("review-notes").value = review.notes || "";
+  $("review-message").textContent = review.data?.review_error ? `بازبینی خودکار کامل نشده: ${review.data.review_error}` : "";
+  $("review-legacy-label").classList.toggle("hidden", state.reviewTimed);
+  $("review-add").classList.toggle("hidden", !state.reviewTimed);
+  $("review-legacy").value = item.transcript_content || "";
+  $("review-sync").classList.toggle("hidden", review.markdown_synced || item.transcript_source !== "human_review");
+  renderReviewRows();
+  const history = $("review-history"); history.replaceChildren();
+  for (const version of review.versions || []) {
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = `نسخه ${faNumber(version.version)} · ${version.reviewer || version.source} · ${qualityLabels[version.status] || qualityLabels.needs_review} · ${dateTime(version.created_at)}`;
+    const article = document.createElement("article"); article.className = "markdown-body"; renderMarkdown(article, version.content);
+    const note = document.createElement("p"); note.textContent = version.notes || "";
+    details.append(summary, note, article); history.append(details);
+  }
+}
+
+async function saveReview(status) {
+  const audioId = state.reviewAudioId;
+  if (status === "approved" && !window.confirm("صوت و متن را بررسی کرده‌اید و این نسخه را به نام خود تأیید می‌کنید؟")) return;
+  const payload = { base_transcript_id: state.reviewBase, status, reviewer: $("reviewer").value, notes: $("review-notes").value };
+  if (state.reviewTimed) payload.segments = state.reviewRows;
+  else payload.content = $("review-legacy").value;
+  state.reviewSaving = true;
+  $("review-card").querySelectorAll("input,textarea,button,select").forEach((element) => { element.disabled = true; });
+  try {
+    const response = await fetch(`/api/files/${audioId}/review`, { method: "POST", headers: { "Content-Type": "application/json", "X-CallForge-UI": "1" }, body: JSON.stringify(payload) });
+    const value = await response.json();
+    if (!response.ok) throw new Error(value.error || "ذخیره ناموفق بود");
+    localStorage.setItem("callforge-reviewer", payload.reviewer);
+    state.reviewDirty = false;
+    await selectFile(audioId, false);
+    $("review-message").textContent = "نسخهٔ جدید در دیتابیس و Markdown ذخیره شد.";
+  } catch (error) { $("review-message").textContent = error.message; }
+  finally {
+    state.reviewSaving = false;
+    $("review-card").querySelectorAll("input,textarea,button,select").forEach((element) => { element.disabled = false; });
+  }
+}
+
+$("review-save").addEventListener("click", () => saveReview("in_review"));
+$("review-focus").addEventListener("click", () => {
+  const focused = document.querySelector(".workspace").classList.toggle("review-focus");
+  $("review-focus").textContent = focused ? "بازگشت به فهرست تماس‌ها" : "نمای متمرکز بازبینی";
+  $("review-card").scrollIntoView({ block: "start" });
+});
+$("review-reload").addEventListener("click", async () => {
+  if (state.reviewDirty && !window.confirm("اصلاحات ذخیره‌نشده کنار گذاشته شوند و نسخهٔ دیتابیس بازخوانی شود؟")) return;
+  state.reviewDirty = false;
+  await selectFile(state.reviewAudioId, false);
+});
+$("review-approve").addEventListener("click", () => saveReview("approved"));
+$("review-only-flags").addEventListener("change", renderReviewRows);
+$("review-speed").addEventListener("change", () => { $("audio-player").playbackRate = Number($("review-speed").value); });
+for (const id of ["reviewer", "review-notes", "review-legacy"]) $(id).addEventListener("input", reviewDirty);
+$("review-add").addEventListener("click", () => {
+  const start = $("audio-player").currentTime || 0;
+  const end = Math.min(start + 5, state.selectedItem.duration_seconds);
+  state.reviewRows.push({ id: `human-${Date.now()}`, start, end, speaker: "گوینده نامشخص", text: "", uncertain: true, flags: [] });
+  reviewDirty(); renderReviewRows();
+});
+$("review-sync").addEventListener("click", async () => {
+  try {
+    const response = await fetch(`/api/files/${state.reviewAudioId}/review/sync`, { method: "POST", headers: { "Content-Type": "application/json", "X-CallForge-UI": "1" }, body: JSON.stringify({ transcript_id: state.reviewBase }) });
+    const value = await response.json(); if (!response.ok) throw new Error(value.error);
+    await selectFile(state.reviewAudioId, false);
+  } catch (error) { $("review-message").textContent = error.message; }
+});
+$("audio-player").addEventListener("timeupdate", () => {
+  const player = $("audio-player");
+  if (playbackEnd !== null && player.currentTime >= playbackEnd) { player.pause(); playbackEnd = null; }
+  for (const card of document.querySelectorAll(".review-segment")) {
+    const row = state.reviewRows.find((item) => item.id === card.dataset.segmentId);
+    card.classList.toggle("playing", Boolean(row && row.start <= player.currentTime && row.end > player.currentTime));
+  }
+});
+window.addEventListener("beforeunload", (event) => { if (state.reviewDirty) { event.preventDefault(); event.returnValue = ""; } });
+
 function resetAndLoad() {
   state.offset = 0;
   loadFiles();
@@ -532,7 +719,7 @@ $("search").addEventListener("input", () => {
   window.clearTimeout(state.debounce);
   state.debounce = window.setTimeout(resetAndLoad, 250);
 });
-["direction", "status", "transcript-filter"].forEach((id) => $(id).addEventListener("change", resetAndLoad));
+["direction", "status", "transcript-filter", "review-filter"].forEach((id) => $(id).addEventListener("change", resetAndLoad));
 $("next-page").addEventListener("click", () => { state.offset += state.limit; loadFiles(); });
 $("prev-page").addEventListener("click", () => { state.offset = Math.max(0, state.offset - state.limit); loadFiles(); });
 $("transcribe-button").addEventListener("click", transcribeSelected);

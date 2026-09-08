@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import importlib.metadata
 import json
 import os
 import platform
@@ -50,7 +51,7 @@ def choose_backend(requested: str) -> str:
     raise RuntimeError("No supported Whisper backend is installed")
 
 
-def compatible_mlx_model(repo_or_path: str, stack: ExitStack) -> str:
+def compatible_mlx_model(repo_or_path: str, stack: ExitStack) -> tuple[str, str]:
     from huggingface_hub import snapshot_download
 
     candidate = Path(repo_or_path).expanduser()
@@ -58,12 +59,12 @@ def compatible_mlx_model(repo_or_path: str, stack: ExitStack) -> str:
     expected = model_path / "weights.safetensors"
     alternate = model_path / "model.safetensors"
     if expected.exists() or not alternate.exists():
-        return str(model_path)
+        return str(model_path), str(model_path)
     alias = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="mlx-whisper-model-")))
     for item in model_path.iterdir():
         target_name = "weights.safetensors" if item.name == "model.safetensors" else item.name
         os.symlink(item, alias / target_name)
-    return str(alias)
+    return str(alias), str(model_path)
 
 
 def mlx_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
@@ -71,17 +72,17 @@ def mlx_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
 
     requested = MLX_MODELS.get(args.model, args.model)
     with ExitStack() as stack:
-        model = compatible_mlx_model(requested, stack)
+        model, args.resolved_model_path = compatible_mlx_model(requested, stack)
         result = mlx_whisper.transcribe(
             samples,
             path_or_hf_repo=model,
             language=args.language,
             task="transcribe",
             verbose=False,
-            temperature=0,
+            temperature=(0.0, 0.2),
             condition_on_previous_text=False,
             initial_prompt=args.prompt,
-            word_timestamps=False,
+            word_timestamps=True,
             no_speech_threshold=0.5,
             compression_ratio_threshold=2.2,
             hallucination_silence_threshold=1.2,
@@ -93,6 +94,10 @@ def mlx_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
             "text": item["text"].strip(),
             "avg_logprob": round(float(item.get("avg_logprob", 0.0)), 4),
             "no_speech_prob": round(float(item.get("no_speech_prob", 0.0)), 4),
+            "compression_ratio": item.get("compression_ratio"),
+            "temperature": item.get("temperature"),
+            "words": [dict(word, start=round(args.start + word["start"], 3),
+                           end=round(args.start + word["end"], 3)) for word in item.get("words", [])],
         }
         for item in result.get("segments", [])
     ]
@@ -109,10 +114,16 @@ def faster_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
         language=args.language,
         task="transcribe",
         beam_size=5,
-        temperature=0,
+        temperature=[0.0, 0.2],
         initial_prompt=args.prompt,
         condition_on_previous_text=False,
-        vad_filter=True,
+        # VAD is retained as independent coverage evidence on both backends.
+        # Do not discard quiet telephone speech solely on a detector decision.
+        vad_filter=False,
+        word_timestamps=True,
+        no_speech_threshold=0.5,
+        compression_ratio_threshold=2.2,
+        hallucination_silence_threshold=1.2,
     )
     segments = []
     texts = []
@@ -126,6 +137,11 @@ def faster_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
                 "text": text,
                 "avg_logprob": round(float(item.avg_logprob), 4),
                 "no_speech_prob": round(float(item.no_speech_prob), 4),
+                "compression_ratio": item.compression_ratio,
+                "temperature": item.temperature,
+                "words": [{"start": round(args.start + word.start, 3),
+                           "end": round(args.start + word.end, 3), "word": word.word,
+                           "probability": word.probability} for word in item.words or []],
             }
         )
     return " ".join(texts).strip(), segments, requested
@@ -137,13 +153,15 @@ def main() -> int:
     parser.add_argument("--backend", choices=("auto", "mlx", "faster"), default="auto")
     parser.add_argument("--model", default="turbo")
     parser.add_argument("--language", default="fa")
-    parser.add_argument("--prompt", default="این یک مکالمه تلفنی فارسی میان کارشناس پشتیبانی و مشتری است.")
+    parser.add_argument("--prompt", default="")
     parser.add_argument("--start", type=float, default=0.0)
     parser.add_argument("--end", type=float)
     args = parser.parse_args()
     audio = args.audio.expanduser().resolve()
     samples = read_clip(audio, args.start, args.end)
     backend = choose_backend(args.backend)
+    from faster_whisper.vad import get_speech_timestamps, VadOptions
+    speech = get_speech_timestamps(samples, vad_options=VadOptions(threshold=.35, min_silence_duration_ms=500, speech_pad_ms=400))
     if backend == "mlx":
         text, segments, model = mlx_transcribe(samples, args)
     else:
@@ -152,11 +170,19 @@ def main() -> int:
         "audio": str(audio),
         "backend": backend,
         "model": model,
+        "resolved_model_path": getattr(args, "resolved_model_path", None),
         "language": args.language,
         "start": args.start,
         "end": args.start + len(samples) / 16_000,
         "text": text,
         "segments": segments,
+        "speech_regions": [{"start": round(args.start + region["start"] / 16000, 3),
+                            "end": round(args.start + region["end"] / 16000, 3)} for region in speech],
+        "settings": {"temperature": [0, .2], "word_timestamps": True,
+                     "condition_on_previous_text": False, "vad_mode": "coverage_only",
+                     "vad_threshold": .35, "prompt": args.prompt},
+        "runtime_versions": {name: importlib.metadata.version(name) for name in
+                             ("numpy", "faster-whisper", "onnxruntime") + (("mlx-whisper",) if backend == "mlx" else ())},
     }
     print(json.dumps(output, ensure_ascii=False))
     return 0
