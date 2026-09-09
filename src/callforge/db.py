@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterator
 
 from callforge.metadata import AudioMetadata
+from callforge.json_utils import dumps as json_dumps
 from callforge.quality import file_hash, render_markdown, text_flags
 
 
@@ -585,7 +586,7 @@ class Database:
             except json.JSONDecodeError:
                 payload[path.name] = {"invalid_json": True, "original": original}
         connection.execute("INSERT OR REPLACE INTO run_evidence VALUES (?, ?, ?)",
-                           (run_id, str(directory), json.dumps(payload, ensure_ascii=False)))
+                           (run_id, str(directory), json_dumps(payload, ensure_ascii=False)))
 
     def complete_run(
         self,
@@ -614,7 +615,7 @@ class Database:
             )
             connection.execute(
                 "INSERT OR REPLACE INTO transcript_reviews (transcript_id, status, data_json, markdown_synced, created_at) VALUES (?, 'needs_review', ?, 1, ?)",
-                (transcript_id, json.dumps(quality or {}, ensure_ascii=False), utcnow()),
+                (transcript_id, json_dumps(quality or {}, ensure_ascii=False), utcnow()),
             )
             self._store_run_evidence(connection, run_id, evidence_directory)
             now = utcnow()
@@ -949,7 +950,7 @@ class Database:
                 Path(audio["absolute_path"]).with_suffix(".md"), current["language"], "human_review", force_version=True)
             connection.execute(
                 "INSERT INTO transcript_reviews (transcript_id,status,reviewer,notes,data_json,base_transcript_id,created_at) VALUES (?,?,?,?,?,?,?)",
-                (transcript_id,status,reviewer.strip(),notes,json.dumps(data,ensure_ascii=False),current["id"],utcnow()),
+                (transcript_id,status,reviewer.strip(),notes,json_dumps(data,ensure_ascii=False),current["id"],utcnow()),
             )
         # DB revision survives disk errors; the UI can explicitly retry publication.
         self.sync_review_markdown(audio_id, transcript_id)

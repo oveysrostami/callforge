@@ -247,6 +247,16 @@ def command_benchmark_freeze(args) -> int:
     return 0
 
 
+def command_benchmark_asr(args) -> int:
+    from callforge.asr_benchmark import run_comparison
+    config = AppConfig.for_root(get_active_root())  # No database writes or publication.
+    report = run_comparison(config, [Path(p).expanduser().resolve() for p in args.reference],
+                            Path(args.output).expanduser().resolve(), args.model,
+                            temperatures=args.temperature, seed=args.seed, context_prompt=not args.no_context_prompt)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["status"] == "completed" else 1
+
+
 def command_benchmark_diarization(args) -> int:
     from callforge.benchmark import run_speaker_experiment
     from datetime import UTC, datetime
@@ -374,6 +384,14 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--audio-id", required=True, type=positive_int)
     freeze.add_argument("--output", help="New JSON path; defaults to the active workspace benchmarks folder")
     freeze.set_defaults(func=command_benchmark_freeze)
+    asr = subparsers.add_parser("benchmark-asr", help="Compare MLX Whisper models locally against frozen references; never publish")
+    asr.add_argument("--reference", action="append", required=True, help="Frozen development JSON; repeat for multiple references")
+    asr.add_argument("--model", action="append", required=True, help="MLX model repository; downloads to the active cache if needed")
+    asr.add_argument("--output", required=True, help="New experiment directory; never overwritten")
+    asr.add_argument("--temperature", type=float, action="append", help="Experimental fallback schedule; repeat")
+    asr.add_argument("--seed", type=int, help="Fix MLX sampling seed for controlled experiments")
+    asr.add_argument("--no-context-prompt", action="store_true", help="Experiment without the normal domain/glossary prompt")
+    asr.set_defaults(func=command_benchmark_asr)
     speakers = subparsers.add_parser("benchmark-diarization", help="Run local speaker detection only, without publishing any transcript")
     speakers.add_argument("--benchmark", required=True)
     speakers.add_argument("--output", help="New experiment directory; existing directories are never overwritten")

@@ -4,10 +4,25 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 import pytest
+import subprocess
 
 from callforge.codex_runner import CodexRunner
 from callforge.config import AppConfig
 from callforge.local_transcriber import LocalWhisperPipeline, PreparedTranscription
+
+
+def test_known_mlx_native_shutdown_failure_retries_once(tmp_path, monkeypatch):
+    config = AppConfig.for_root(tmp_path)
+    stderr = tmp_path / "stderr.log"
+    responses = [
+        subprocess.CompletedProcess([], -6, "", "recursive_mutex lock failed: Invalid argument"),
+        subprocess.CompletedProcess([], 0, '{"segments": []}', ""),
+    ]
+    monkeypatch.setattr("callforge.local_transcriber.subprocess.run", lambda *a, **k: responses.pop(0))
+    result = LocalWhisperPipeline(config)._run_json(["whisper"], tmp_path / "result.json", stderr, "Whisper AGC pass")
+    assert result["segments"] == []
+    assert not responses
+    assert "retrying this pass once" in stderr.read_text()
 
 
 @pytest.fixture(autouse=True)
@@ -98,6 +113,7 @@ print(json.dumps({
     "segments": [],
     "hf_home": os.environ.get("HF_HOME"),
     "python": sys.executable,
+    "prompt": sys.argv[sys.argv.index("--prompt") + 1],
 }))
 """.strip()
         + "\n",
@@ -119,12 +135,64 @@ print(json.dumps({
     agc = json.loads(prepared.agc_transcript_path.read_text(encoding="utf-8"))
     assert raw["hf_home"] == agc["hf_home"] == str(config.models.resolve())
     assert raw["python"] == agc["python"] == sys.executable
+    assert "مکالمه تلفنی فارسی" in raw["prompt"]
     events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert events[0]["stage"] == "prepare_audio"
     assert any(event["stage"] == "model_download" for event in events)
     assert events[-1]["stage"] == "whisper"
     assert events[-1]["state"] == "completed"
     assert (work / "evidence.json").is_file()
+
+
+def test_local_pipeline_recovers_vad_only_speech_in_a_context_window(tmp_path):
+    config = replace(AppConfig.for_root(tmp_path), whisper_retry_segments=0)
+    config.ensure()
+    skill = tmp_path / "skill"
+    scripts = skill / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "prepare_audio.py").write_text(
+        """
+import argparse, json
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument("source")
+parser.add_argument("--output-dir", required=True)
+args = parser.parse_args()
+output = Path(args.output_dir)
+raw = output / "raw.wav"; raw.write_bytes(b"raw")
+agc = output / "agc.wav"; agc.write_bytes(b"agc")
+print(json.dumps({"raw_wav": str(raw), "agc_wav": str(agc), "duration_seconds": 12}))
+""".strip() + "\n", encoding="utf-8")
+    (scripts / "transcribe_audio.py").write_text(
+        """
+import json, sys
+if "--start" not in sys.argv:
+    print(json.dumps({"text": "", "segments": [], "speech_regions": [{"start": 0, "end": 4}]}))
+else:
+    print(json.dumps({"start": 0, "end": 10, "text": "سلام دنیا", "segments": [{
+        "start": 1, "end": 3, "text": "سلام دنیا", "avg_logprob": -.2,
+        "no_speech_prob": .01, "compression_ratio": 1.0,
+        "words": [{"start": 1, "end": 1.5, "word": "سلام "},
+                  {"start": 2, "end": 2.5, "word": "دنیا"}]}]}))
+""".strip() + "\n", encoding="utf-8")
+    audio = tmp_path / "external-201-123.mp3"
+    audio.write_bytes(b"audio")
+    work = config.runs / "coverage-run"; work.mkdir()
+    log = config.logs / "coverage.jsonl"
+    stderr = config.logs / "coverage.stderr.log"; stderr.write_text("")
+
+    LocalWhisperPipeline(config, skill).prepare(audio, work, log, stderr)
+
+    result = json.loads((work / "evidence.json").read_text(encoding="utf-8"))
+    assert result["coverage_recovery"] == {
+        "requested_windows": 1, "completed_windows": 1,
+        "recovered_segments": 1, "remaining_segments": 0, "audio_variant": "raw",
+    }
+    assert result["segments"][0]["retry"]["text"] == "سلام دنیا"
+    assert (work / "coverage-1.json").is_file()
+    events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert any(event["stage"] == "whisper_coverage" and event["state"] == "completed"
+               for event in events)
 
 
 def test_codex_prompt_only_requests_review_of_prepared_transcripts(tmp_path):

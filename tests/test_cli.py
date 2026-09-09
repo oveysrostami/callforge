@@ -65,6 +65,14 @@ def test_only_commands_that_need_a_scope_accept_a_directory_argument():
         assert not hasattr(parser.parse_args([command]), "directory")
 
 
+def test_asr_benchmark_accepts_multiple_frozen_references_and_models():
+    args = cli.build_parser().parse_args(["benchmark-asr", "--reference", "a.json", "--reference", "b.json",
+        "--model", "q4", "--model", "fp16", "--output", "experiment"])
+    assert args.reference == ["a.json", "b.json"]
+    assert args.model == ["q4", "fp16"]
+    assert args.func is cli.command_benchmark_asr
+
+
 def test_reset_command_uses_active_workspace_and_requires_confirmation(tmp_path: Path, monkeypatch, capsys):
     audio_root = tmp_path / "audio"
     audio_root.mkdir()

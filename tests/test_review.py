@@ -46,6 +46,26 @@ def test_human_review_is_versioned_synced_and_optimistically_locked(tmp_path):
     assert len(database.review_detail(audio_id)["versions"]) == 2
 
 
+def test_nonfinite_metrics_are_normalized_in_transcript_and_run_evidence(tmp_path):
+    database, audio, audio_id, _, rows = prepared(tmp_path)
+    database.queue_transcription(audio_id)
+    job = database.claim_audio_job(audio_id, "worker", 100)
+    run = database.start_run(job, "worker", tmp_path / "numeric.jsonl", tmp_path / "numeric.stderr")
+    directory = tmp_path / "evidence"
+    directory.mkdir()
+    (directory / "legacy.json").write_text('{"score":Infinity}')
+    rows[0]["retry"] = {"avg_logprob": float("nan")}
+    transcript = database.complete_run(job, run, render_markdown(audio.name, rows), audio.with_suffix(".md"),
+                                       "fa", None, quality={"segments": rows}, evidence_directory=directory)
+    def reject(token):
+        raise ValueError(token)
+    with database.connect() as connection:
+        data = json.loads(connection.execute("SELECT data_json FROM transcript_reviews WHERE transcript_id=?", (transcript,)).fetchone()[0], parse_constant=reject)
+        evidence = json.loads(connection.execute("SELECT payload_json FROM run_evidence WHERE processing_run_id=?", (run,)).fetchone()[0], parse_constant=reject)
+    assert data["segments"][0]["retry"]["avg_logprob"] is None
+    assert evidence["legacy.json"]["score"] is None
+
+
 def test_external_markdown_is_not_overwritten_and_db_revision_survives(tmp_path):
     database, audio, audio_id, initial, rows = prepared(tmp_path)
     audio.with_suffix(".md").write_text("external change", encoding="utf-8")

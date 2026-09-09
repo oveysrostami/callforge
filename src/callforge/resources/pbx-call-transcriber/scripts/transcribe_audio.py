@@ -7,11 +7,12 @@ import argparse
 import importlib.util
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import tempfile
 import wave
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,62 @@ MLX_MODELS = {
     "full": "mlx-community/whisper-large-v3-mlx",
 }
 FASTER_MODELS = {"turbo": "large-v3-turbo", "full": "large-v3"}
+
+
+def finite_json(value):
+    # Keep the standalone skill helper independent of the CallForge package.
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: finite_json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [finite_json(item) for item in value]
+    return value
+
+
+def sanitize_segments(segments):
+    for row in segments:
+        invalid = [key for key in ("avg_logprob", "no_speech_prob", "compression_ratio")
+                   if isinstance(row.get(key), (int, float)) and not math.isfinite(row[key])]
+        if invalid:
+            row["flags"] = sorted(set(row.get("flags", []) + ["invalid_asr_metrics"]))
+            row["invalid_metrics"] = invalid
+    return finite_json(segments)
+
+
+@contextmanager
+def guarded_mlx_decoder():
+    """End an impossible token path instead of computing -inf - (-inf).
+
+    Scoped to this helper's transcription; no installed library files change.
+    A forced end marks the result as truncated, never as a confident decode.
+    """
+    import mlx.core as mx
+    import mlx_whisper.decoding as decoding
+    original = decoding.GreedyDecoder
+    warnings = []
+    class GuardedDecoder(original):
+        def update(self, tokens, logits, sum_logprobs):
+            if bool(mx.any(mx.isnan(logits) | (logits == mx.inf))):
+                raise FloatingPointError("Whisper produced invalid decoder logits")
+            finished = tokens[:, -1] == self.eot
+            dead = mx.all(logits == -mx.inf, axis=-1)
+            if bool(mx.any(dead & ~finished)):
+                warnings.append("decoder_truncated")
+            # Finished hypotheses must not evaluate -inf * 0 either.
+            forced = mx.full_like(logits, -mx.inf)
+            forced[:, self.eot] = 0.
+            logits = mx.where((dead | finished)[:, None], forced, logits)
+            # Mark only this failed hypothesis as unusable. Whisper's existing
+            # bounded temperature fallback now sees a low score and can retry;
+            # NaN previously made its threshold comparison silently false.
+            sum_logprobs = mx.where(dead & ~finished, -mx.inf, sum_logprobs)
+            return super().update(tokens, logits, sum_logprobs)
+    decoding.GreedyDecoder = GuardedDecoder
+    try:
+        yield warnings
+    finally:
+        decoding.GreedyDecoder = original
 
 
 def read_clip(path: Path, start: float, end: float | None) -> np.ndarray:
@@ -69,9 +126,12 @@ def compatible_mlx_model(repo_or_path: str, stack: ExitStack) -> tuple[str, str]
 
 def mlx_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
     import mlx_whisper
+    if getattr(args, "seed", None) is not None:
+        import mlx.core as mx
+        mx.random.seed(args.seed)
 
     requested = MLX_MODELS.get(args.model, args.model)
-    with ExitStack() as stack:
+    with ExitStack() as stack, guarded_mlx_decoder() as decoder_warnings:
         model, args.resolved_model_path = compatible_mlx_model(requested, stack)
         result = mlx_whisper.transcribe(
             samples,
@@ -79,7 +139,7 @@ def mlx_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
             language=args.language,
             task="transcribe",
             verbose=False,
-            temperature=(0.0, 0.2),
+            temperature=tuple(getattr(args, "temperatures", None) or (0.0, 0.2)),
             condition_on_previous_text=False,
             initial_prompt=args.prompt,
             word_timestamps=True,
@@ -101,7 +161,11 @@ def mlx_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
         }
         for item in result.get("segments", [])
     ]
-    return result.get("text", "").strip(), segments, requested
+    if decoder_warnings:
+        for row in segments:
+            if not math.isfinite(row["avg_logprob"]):
+                row["flags"] = ["decoder_truncated"]
+    return result.get("text", "").strip(), sanitize_segments(segments), requested
 
 
 def faster_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
@@ -114,7 +178,7 @@ def faster_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
         language=args.language,
         task="transcribe",
         beam_size=5,
-        temperature=[0.0, 0.2],
+        temperature=getattr(args, "temperatures", None) or [0.0, 0.2],
         initial_prompt=args.prompt,
         condition_on_previous_text=False,
         # VAD is retained as independent coverage evidence on both backends.
@@ -144,7 +208,7 @@ def faster_transcribe(samples: np.ndarray, args) -> tuple[str, list[dict], str]:
                            "probability": word.probability} for word in item.words or []],
             }
         )
-    return " ".join(texts).strip(), segments, requested
+    return " ".join(texts).strip(), sanitize_segments(segments), requested
 
 
 def main() -> int:
@@ -156,7 +220,12 @@ def main() -> int:
     parser.add_argument("--prompt", default="")
     parser.add_argument("--start", type=float, default=0.0)
     parser.add_argument("--end", type=float)
+    parser.add_argument("--temperature", dest="temperatures", type=float, action="append",
+                        help="Ordered fallback temperatures; repeat to override the default 0, 0.2")
+    parser.add_argument("--seed", type=int, help="MLX sampling seed for controlled experiments")
     args = parser.parse_args()
+    if args.temperatures and any(not math.isfinite(t) or not 0 <= t <= 1 for t in args.temperatures):
+        parser.error("temperatures must be finite values between 0 and 1")
     audio = args.audio.expanduser().resolve()
     samples = read_clip(audio, args.start, args.end)
     backend = choose_backend(args.backend)
@@ -178,13 +247,14 @@ def main() -> int:
         "segments": segments,
         "speech_regions": [{"start": round(args.start + region["start"] / 16000, 3),
                             "end": round(args.start + region["end"] / 16000, 3)} for region in speech],
-        "settings": {"temperature": [0, .2], "word_timestamps": True,
+        "settings": {"temperature": args.temperatures or [0, .2], "seed": args.seed, "word_timestamps": True,
                      "condition_on_previous_text": False, "vad_mode": "coverage_only",
+                     "decoder_numerics_guard": backend == "mlx",
                      "vad_threshold": .35, "prompt": args.prompt},
         "runtime_versions": {name: importlib.metadata.version(name) for name in
                              ("numpy", "faster-whisper", "onnxruntime") + (("mlx-whisper",) if backend == "mlx" else ())},
     }
-    print(json.dumps(output, ensure_ascii=False))
+    print(json.dumps(finite_json(output), ensure_ascii=False, allow_nan=False))
     return 0
 
 

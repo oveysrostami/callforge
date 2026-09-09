@@ -25,13 +25,14 @@ The helper automatically selects MLX Whisper on Apple Silicon and faster-whisper
 
 ## CallForge-managed review
 
-When the request supplies prepared JSON paths and a canonical evidence timeline, read these files (including selective-retry evidence when present), compare timed segments, and return the structured response required by the supplied schema. In this mode:
+When the request supplies prepared JSON paths and a canonical evidence timeline, read these files (including contextual coverage recovery and selective-retry evidence when present), compare timed segments, and return the structured response required by the supplied schema. In this mode:
 
 - do not run audio preparation or Whisper again;
 - do not inspect, install, repair, download, or benchmark runtimes or models;
 - do not write files, create extra artifacts, or claim to have listened to the source audio;
 - resolve disagreements from the two supplied passes when possible and use `[نامفهوم]` otherwise.
 - include every canonical segment id exactly once, retaining complete wording without summarization; put unresolved speech in `[نامفهوم]`, set `uncertain=true`, and explain the unresolved difference in `notes`;
+- enhanced alternatives are partitioned between review units; do not repeat one unit's alternative in its neighbors. `alternative_timing_uncertain` marks a joint unit with unavailable word timing, not automatically unintelligible speech;
 - do not alter timing or omit a segment because it is repetitive or difficult; describe confirmed non-speech explicitly and flag uncertain non-speech decisions;
 - keep numbers and units grounded in the supplied evidence; never make the transcript more specific than that evidence;
 - when CallForge says the separate speaker pipeline is enabled, return `گوینده نامشخص` during text review. CallForge subsequently runs local community-1 diarization, aligns ambiguous reviewed words with the Persian CTC model, and infers roles from evidence attached to each acoustic voice. Do not run those stages yourself or rewrite text to fit a proposed role;
@@ -48,6 +49,7 @@ Use this workflow only when CallForge-managed JSON inputs were not supplied.
 5. Run two complementary (not statistically independent) transcription passes with `scripts/transcribe_audio.py`:
    - turbo model on the raw 16 kHz WAV;
    - turbo model on the AGC WAV.
+   - for Persian calls, pass the neutral context prompt `این یک مکالمه تلفنی فارسی میان مشتری و کارشناس پشتیبانی است.` and append glossary terms only as possible spellings; reject any decoder output that merely echoes this prompt.
 6. Compare segment timing and wording. For disagreements, low-confidence segments, names, phone numbers, money, or identifiers, use `[نامفهوم]` unless the user explicitly requested full-model review. Never download the full model implicitly.
 7. Reconstruct speaker turns conservatively. Telephone recordings may be mono; do not pretend speaker diarization is certain.
 8. Read the final text from start to finish and remove Whisper hallucinations caused by silence, repeated fragments, and impossible continuations.

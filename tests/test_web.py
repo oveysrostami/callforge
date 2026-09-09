@@ -35,6 +35,26 @@ def get_json(url: str):
         return response.status, json.loads(response.read())
 
 
+def test_legacy_nonfinite_review_metrics_do_not_break_file_selection(tmp_path):
+    import sqlite3
+    server, thread, audio_id = prepared_server(tmp_path)
+    try:
+        config = AppConfig.for_root(tmp_path)
+        with sqlite3.connect(config.database) as connection:
+            transcript = connection.execute("SELECT id FROM transcripts WHERE audio_file_id=?", (audio_id,)).fetchone()[0]
+            connection.execute("INSERT INTO transcript_reviews (transcript_id,status,data_json,created_at) VALUES (?,?,?,?)",
+                (transcript, "needs_review", '{"segments":[{"retry":{"avg_logprob":NaN,"x":Infinity,"y":-Infinity}}]}', "2026-09-08"))
+        def reject(value):
+            raise ValueError(value)
+        for suffix in ("", "/review"):
+            with urlopen(f"http://127.0.0.1:{server.server_address[1]}/api/files/{audio_id}{suffix}") as response:
+                data = json.loads(response.read(), parse_constant=reject)
+                value = data if suffix else data["review"]
+                assert value["data"]["segments"][0]["retry"] == {"avg_logprob": None, "x": None, "y": None}
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=3)
+
+
 def test_human_review_http_roundtrip_history_and_filter(tmp_path):
     server, thread, audio_id = prepared_server(tmp_path)
     base = f"http://127.0.0.1:{server.server_address[1]}"

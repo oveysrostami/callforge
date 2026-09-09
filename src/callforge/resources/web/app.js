@@ -544,6 +544,7 @@ async function transcribeSelected() {
 const qualityLabels = { needs_review: "نیازمند بازبینی انسانی", in_review: "در حال بازبینی انسانی", approved: "تأییدشده توسط انسان" };
 const flagLabels = { repetition: "تکرار مشکوک", compression: "تکرار/فشردگی متن", pass_disagreement: "اختلاف دو پاس", speech_gap: "احتمال گفتار حذف‌شده", verify_numbers: "بررسی عدد", unsupported_number: "عدد بدون پشتوانه", unclear: "نامفهوم", low_logprob: "خروجی ضعیف مدل", possible_non_speech: "احتمال سکوت", large_revision: "تغییر عمده", uncertain_wording: "عبارت نامطمئن" };
 Object.assign(flagLabels, { speaker_uncertain: "صدای نامطمئن", speaker_overlap: "هم‌پوشانی صداها", word_aligned: "تطبیق کلمات با صدا", boundary_review_required: "مرز گفتار نیازمند بازبینی", mixed_speakers: "چند گوینده در یک بخش" });
+Object.assign(flagLabels, { invalid_asr_metrics: "امتیاز Whisper نامعتبر؛ نیازمند بازبینی", decoder_truncated: "توقف زودهنگام Whisper؛ نیازمند بازبینی" });
 let playbackEnd = null;
 
 function reviewDirty() {

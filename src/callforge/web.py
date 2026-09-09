@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from callforge import __version__
+from callforge.json_utils import dumps as json_dumps
 from callforge.config import AppConfig
 from callforge.db import Database
 from callforge.progress import read_progress_events
@@ -197,7 +198,7 @@ def make_handler(
             return result
 
         def _sse(self, event: str, value: object, event_id: str | None = None) -> None:
-            payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            payload = json_dumps(value, ensure_ascii=False, separators=(",", ":"))
             parts = []
             if event_id:
                 parts.append(f"id: {event_id}\n")
@@ -236,7 +237,7 @@ def make_handler(
                     current_run_id = run_id
                     line_offset = 0
                 public = self._public_snapshot(snapshot)
-                serialized = json.dumps(public, ensure_ascii=False, sort_keys=True)
+                serialized = json_dumps(public, ensure_ascii=False, sort_keys=True)
                 if serialized != last_snapshot:
                     self._sse("snapshot", public, f"snapshot-{run_id or 0}")
                     last_snapshot = serialized
@@ -348,7 +349,7 @@ def make_handler(
             send_body: bool,
             status: HTTPStatus = HTTPStatus.OK,
         ) -> None:
-            content = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            content = json_dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(content)))
