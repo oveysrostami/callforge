@@ -126,6 +126,37 @@ def speaker_check() -> Check:
     return Check("Speaker / role pipeline", ok, "models verified by setup" if ok else "run callforge setup --yes")
 
 
+def quality_checks() -> list[Check]:
+    try:
+        from callforge.registry import get_active_root
+        from callforge.config import AppConfig
+        config = AppConfig.for_root(get_active_root())
+        hub = config.models / "hub"
+    except RuntimeError:
+        config = None
+        hub = Path.home() / ".cache" / "huggingface" / "hub"
+    from callforge.qwen_runtime import ready
+    qwen_ok, qwen_detail = ready(config)
+    turbo = any(hub.glob("models--mlx-community--whisper-large-v3-turbo/snapshots/*")) or any(
+        hub.glob("models--Systran--faster-whisper-large-v3-turbo/snapshots/*"))
+    full = any(hub.glob("models--mlx-community--whisper-large-v3-mlx/snapshots/*")) or any(
+        hub.glob("models--Systran--faster-whisper-large-v3/snapshots/*"))
+    qwen_models = all(any(hub.glob(f"models--Qwen--{name}/snapshots/*"))
+                      for name in ("Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B"))
+    try:
+        import torch
+        mps = bool(torch.backends.mps.is_available())
+    except Exception:
+        mps = False
+    return [
+        Check("ASR primary cache", turbo, "non-Q4 large-v3-turbo" if turbo else "run setup --quality-models"),
+        Check("ASR fallback cache", full, "full large-v3" if full else "run setup --quality-models"),
+        Check("Qwen Python 3.12 runtime", qwen_ok, qwen_detail),
+        Check("Qwen candidate cache", qwen_models, "0.6B + 1.7B" if qwen_models else "optional; run setup --quality-models"),
+        Check("MPS", mps, "available" if mps else "unavailable; Qwen falls back to CPU"),
+    ]
+
+
 def hf_instructions() -> None:
     print("Hugging Face setup (audio stays local):", flush=True)
     print("1. Sign in and personally accept the model conditions: https://huggingface.co/pyannote/speaker-diarization-community-1", flush=True)
@@ -174,6 +205,8 @@ def setup_models() -> None:
     try:
         config = AppConfig.for_root(get_active_root())
         whisper_env = config.runtime_environment()
+        whisper_env.pop("HF_HUB_OFFLINE", None)
+        whisper_env.pop("TRANSFORMERS_OFFLINE", None)
         whisper_env["PYTHONPATH"] = env["PYTHONPATH"]
     except RuntimeError:
         config = None
@@ -209,10 +242,11 @@ def enable_speakers(config) -> None:
     print("Speaker/role pipeline enabled for the active workspace (run and UI). Restart an already-running UI to load settings.", flush=True)
 
 
-def setup(install_missing: bool, force_skill: bool = False, diarization: bool = True) -> list[Check]:
+def setup(install_missing: bool, force_skill: bool = False, diarization: bool = True,
+          quality_models: bool = False) -> list[Check]:
     current = checks()
     if not install_missing:
-        return current + [speaker_check()]
+        return current + [speaker_check()] + quality_checks()
     by_name = {item.name: item for item in current}
     if not by_name["Codex CLI"].ok:
         install_codex()
@@ -225,4 +259,16 @@ def setup(install_missing: bool, force_skill: bool = False, diarization: bool = 
             raise RuntimeError("Codex login required. Run callforge setup in an interactive terminal.")
         subprocess.run([shutil.which("codex"), "login"], check=True)
     setup_models()
-    return checks() + [speaker_check()]
+    if quality_models:
+        from callforge.qwen_runtime import install as install_qwen, environment as qwen_environment
+        from callforge.config import AppConfig
+        from callforge.registry import get_active_root
+        try:
+            config = AppConfig.for_root(get_active_root())
+        except RuntimeError:
+            config = None
+        install_qwen(config)
+        env = qwen_environment(config, offline=False)
+        subprocess.run([sys.executable, "-m", "callforge.setup_models", "quality-models"],
+                       env=env, check=True, timeout=7200)
+    return checks() + [speaker_check()] + quality_checks()

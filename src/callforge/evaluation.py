@@ -54,10 +54,17 @@ def sample_calls(rows: list[dict], count: int, seed: int) -> list[dict]:
             if len(result) >= count:
                 break
             row = dict(strata[key].pop())
-            row["evaluation_split"] = "holdout" if len(result) % 5 == 0 else "development"
             result.append(row)
             if not strata[key]:
                 del strata[key]
+    if len(result) == 40:
+        for index, row in enumerate(result):
+            row["evaluation_split"] = "development" if index < 30 else "holdout"
+    else:
+        # Preserve the legacy deterministic split for partial review batches;
+        # the promotion gate still requires the fixed 30/10 corpus.
+        for index, row in enumerate(result):
+            row["evaluation_split"] = "holdout" if index % 5 == 0 else "development"
     return result
 
 

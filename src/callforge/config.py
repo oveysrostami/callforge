@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,17 @@ class AppConfig:
     whisper_retry_model: str = "turbo"
     whisper_retry_segments: int = 3
     whisper_retry_seconds: int = 120
+    transcription_profile: str = "max_quality_v2"
+    asr_primary: str = "mlx-whisper:large-v3-turbo"
+    asr_fallback: str = "mlx-whisper:large-v3"
+    asr_alternative: str = ""
+    asr_context_prompt: bool = False
+    audio_enhancement: str = "adaptive"
+    recovery_min_seconds: int = 8
+    recovery_max_seconds: int = 15
+    recovery_expand_seconds: int = 30
+    recovery_context_seconds: int = 2
+    asr_heavy_concurrency: int = 1
     glossary: tuple[str, ...] = ()
     diarization: bool = False
     diarization_timeout_seconds: int = 180
@@ -53,6 +65,9 @@ class AppConfig:
                 values = tomllib.load(handle).get("callforge", {})
         if not isinstance(values.get("glossary", []), list) or not all(isinstance(item, str) for item in values.get("glossary", [])):
             raise ValueError("glossary must be a TOML array of spelling hints")
+        legacy_primary = str(values.get("whisper_model", "turbo"))
+        legacy_fallback = str(values.get("whisper_retry_model", "full"))
+        legacy_names = {"turbo": "large-v3-turbo", "turbo-q4": "large-v3-turbo-q4", "full": "large-v3"}
         config = cls(
             root=resolved,
             workspace=workspace,
@@ -85,6 +100,17 @@ class AppConfig:
             whisper_retry_model=str(values.get("whisper_retry_model", "turbo")),
             whisper_retry_segments=int(values.get("whisper_retry_segments", 3)),
             whisper_retry_seconds=int(values.get("whisper_retry_seconds", 120)),
+            transcription_profile=str(values.get("transcription_profile", "max_quality_v2")),
+            asr_primary=str(values.get("asr_primary", f"mlx-whisper:{legacy_names.get(legacy_primary, legacy_primary)}")),
+            asr_fallback=str(values.get("asr_fallback", f"mlx-whisper:{legacy_names.get(legacy_fallback, legacy_fallback)}")),
+            asr_alternative=str(values.get("asr_alternative", "")),
+            asr_context_prompt=bool(values.get("asr_context_prompt", False)),
+            audio_enhancement=str(values.get("audio_enhancement", "adaptive")),
+            recovery_min_seconds=int(values.get("recovery_min_seconds", 8)),
+            recovery_max_seconds=int(values.get("recovery_max_seconds", 15)),
+            recovery_expand_seconds=int(values.get("recovery_expand_seconds", 30)),
+            recovery_context_seconds=int(values.get("recovery_context_seconds", 2)),
+            asr_heavy_concurrency=int(values.get("asr_heavy_concurrency", 1)),
             glossary=tuple(str(item) for item in values.get("glossary", [])),
             diarization=bool(values.get("diarization", True)),
             diarization_timeout_seconds=int(values.get("diarization_timeout_seconds", 180)),
@@ -95,6 +121,12 @@ class AppConfig:
             raise ValueError("codex_review_attempts must be between 1 and 3")
         if config.whisper_retry_segments < 0 or config.whisper_retry_seconds < 1 or config.diarization_timeout_seconds < 1:
             raise ValueError("Retry segments must be nonnegative and retry seconds positive")
+        if not 0 < config.recovery_min_seconds <= config.recovery_max_seconds <= config.recovery_expand_seconds:
+            raise ValueError("Recovery windows must satisfy 0 < min <= max <= expand")
+        if config.recovery_context_seconds < 0 or config.asr_heavy_concurrency != 1:
+            raise ValueError("Recovery context must be nonnegative and heavy concurrency must be 1")
+        if config.audio_enhancement not in {"off", "adaptive"}:
+            raise ValueError("audio_enhancement must be off or adaptive")
         if (
             config.whisper_timeout_seconds < 1
             or config.codex_timeout_seconds < 1
@@ -150,6 +182,17 @@ class AppConfig:
                 'whisper_retry_model = "turbo"\n'
                 'whisper_retry_segments = 3\n'
                 'whisper_retry_seconds = 120\n'
+                'transcription_profile = "max_quality_v2"\n'
+                'asr_primary = "mlx-whisper:large-v3-turbo"\n'
+                'asr_fallback = "mlx-whisper:large-v3"\n'
+                'asr_alternative = ""\n'
+                'asr_context_prompt = false\n'
+                'audio_enhancement = "adaptive"\n'
+                'recovery_min_seconds = 8\n'
+                'recovery_max_seconds = 15\n'
+                'recovery_expand_seconds = 30\n'
+                'recovery_context_seconds = 2\n'
+                'asr_heavy_concurrency = 1\n'
                 'glossary = []\n'
                 'diarization = true\n'
                 'diarization_timeout_seconds = 180\n'
@@ -157,6 +200,37 @@ class AppConfig:
                 'role_timeout_seconds = 180\n',
                 encoding="utf-8",
             )
+        else:
+            # Idempotent additive migration: preserve every user value and only
+            # add v2 keys that older workspaces cannot contain.
+            with config_path.open("rb") as handle:
+                existing = tomllib.load(handle).get("callforge", {})
+            defaults = {
+                "transcription_profile": '"max_quality_v2"',
+                "asr_primary": '"mlx-whisper:large-v3-turbo"',
+                "asr_fallback": '"mlx-whisper:large-v3"',
+                "asr_alternative": '""',
+                "asr_context_prompt": "false",
+                "audio_enhancement": '"adaptive"',
+                "recovery_min_seconds": "8",
+                "recovery_max_seconds": "15",
+                "recovery_expand_seconds": "30",
+                "recovery_context_seconds": "2",
+                "asr_heavy_concurrency": "1",
+            }
+            missing = [(key, value) for key, value in defaults.items() if key not in existing]
+            if missing:
+                text = config_path.read_text(encoding="utf-8")
+                match = re.search(r"(?ms)^\[callforge\][^\n]*\n.*?(?=^\[|\Z)", text)
+                if match is None:
+                    raise ValueError("config.toml has no [callforge] table")
+                addition = "\n# max_quality_v2 (added by an idempotent migration)\n" + "".join(
+                    f"{key} = {value}\n" for key, value in missing
+                )
+                updated = text[:match.end()] + addition + text[match.end():]
+                temporary = config_path.with_name(f"config.{os.getpid()}.tmp")
+                temporary.write_text(updated, encoding="utf-8")
+                temporary.replace(config_path)
 
     def runtime_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -171,4 +245,6 @@ class AppConfig:
             from callforge.speaker_runtime import paths
             environment["HF_HOME"] = str(paths(self)[1])
         environment["CALLFORGE_MANAGED_TRANSCRIPTION"] = "1"
+        environment["HF_HUB_OFFLINE"] = "1"
+        environment["TRANSFORMERS_OFFLINE"] = "1"
         return environment

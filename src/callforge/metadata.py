@@ -9,7 +9,7 @@ from pathlib import Path
 
 CALL_FILENAME = re.compile(
     r"^(?P<prefix>external|internal|out)-(?P<first>[^-]+)-(?P<second>[^-]+)-"
-    r"(?P<date>\d{8})-(?P<time>\d{6})-(?P<call_id>.+)\.mp3$",
+    r"(?P<date>\d{8})-(?P<time>\d{6})-(?P<call_id>.+)\.(?:mp3|wav|m4a|flac|ogg)$",
     re.IGNORECASE,
 )
 
@@ -83,14 +83,17 @@ def extract_audio_metadata(path: Path, root: Path) -> AudioMetadata:
     duration = codec = bitrate = sample_rate = channels = None
     error = None
     try:
-        from mutagen.mp3 import MP3
+        from mutagen import File as MutagenFile
 
-        info = MP3(resolved).info
+        parsed_file = MutagenFile(resolved)
+        if parsed_file is None or not getattr(parsed_file, "info", None):
+            raise ValueError("unsupported or unreadable audio container")
+        info = parsed_file.info
         duration = round(float(info.length), 6)
-        codec = "mp3"
-        bitrate = int(info.bitrate) if info.bitrate else None
-        sample_rate = int(info.sample_rate) if info.sample_rate else None
-        channels = int(info.channels) if info.channels else None
+        codec = resolved.suffix.lower().lstrip(".")
+        bitrate = int(value) if (value := getattr(info, "bitrate", None)) else None
+        sample_rate = int(value) if (value := getattr(info, "sample_rate", None)) else None
+        channels = int(value) if (value := getattr(info, "channels", None)) else None
     except Exception as exc:  # Broken audio is indexed and reported instead of skipped.
         error = f"{type(exc).__name__}: {exc}"
     return AudioMetadata(

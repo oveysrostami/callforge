@@ -1,7 +1,4 @@
 import json
-import sys
-from types import SimpleNamespace
-
 import pytest
 
 from callforge.asr_benchmark import run_comparison
@@ -19,11 +16,7 @@ def test_asr_experiment_keeps_reference_out_of_decoder_and_preserves_files(tmp_p
         "audio_path": str(source), "audio_sha256": file_hash(source),
         "reference": {"content": "", "segments": [{"text": "SECRET REFERENCE"}]}}))
     before = [file_hash(path) for path in (source, markdown, snapshot)]
-    downloads, commands = [], []
-    def download(**kwargs):
-        downloads.append(kwargs)
-        return "/cached/fixed-revision"
-    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=download))
+    commands = []
     def run(self, command, destination, *args, **kwargs):
         commands.append(command)
         if command[1].endswith("prepare_audio.py"):
@@ -40,7 +33,7 @@ def test_asr_experiment_keeps_reference_out_of_decoder_and_preserves_files(tmp_p
     assert commands[1][commands[1].index("--prompt") + 1] == ""
     assert commands[1].count("--temperature") == 3
     assert all("SECRET" not in " ".join(command) for command in commands)
-    assert downloads[0]["cache_dir"] == str(config.models / "hub")
+    assert result["network_policy"].startswith("offline")
     assert before == [file_hash(path) for path in (source, markdown, snapshot)]
     assert not config.database.exists()
     with pytest.raises(FileExistsError):

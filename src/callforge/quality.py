@@ -239,7 +239,10 @@ def attach_coverage_retry(evidence: dict, retry: dict, segment_ids: list[str]) -
 def compact_review_input(evidence: dict) -> dict:
     """Keep the complete call context, not duplicated word-level diagnostics."""
     return {"duration_seconds": evidence["duration_seconds"], "segments": [
-        {**{key: row.get(key) for key in ("id", "start", "end", "text", "alternative", "flags", "speaker")},
+        {**{key: row.get(key) for key in (
+            "id", "start", "end", "text", "alternative", "flags", "speaker",
+            "confidence_tier", "uncertainty_spans", "candidate_sources", "reason",
+        )},
          "retry_text": usable_retry_text(row)}
         for row in evidence["segments"]]}
 
@@ -257,6 +260,117 @@ def aligned_words(segment: dict) -> list[dict]:
             return []
         previous = end
     return words
+
+
+QUARANTINE_FLAGS = {
+    "repetition", "compression", "invalid_asr_metrics", "decoder_truncated",
+    "invalid_timestamp", "prompt_leakage",
+}
+
+
+def segment_timing_flags(segment: dict, duration: float) -> list[str]:
+    flags = set(text_flags(str(segment.get("text", "")), segment))
+    start, end = segment.get("start"), segment.get("end")
+    if (not isinstance(start, (int, float)) or not isinstance(end, (int, float))
+            or not math.isfinite(start + end) or start < 0 or end <= start
+            or start >= duration or end > duration + .25):
+        flags.add("invalid_timestamp")
+    words = segment.get("words") or []
+    if words and not aligned_words(segment):
+        flags.add("invalid_timestamp")
+    if sum(word.get("start") == word.get("end") for word in words) > 1:
+        flags.add("invalid_timestamp")
+    return sorted(flags)
+
+
+def segment_is_quarantined(segment: dict, duration: float) -> bool:
+    return bool(set(segment_timing_flags(segment, duration)) & QUARANTINE_FLAGS)
+
+
+def validate_timeline(rows: list[dict], duration: float) -> None:
+    previous_end = 0.0
+    intervals = set()
+    owned = set()
+    for row in sorted(rows, key=lambda item: (item["start"], item["end"])):
+        start, end = float(row["start"]), float(row["end"])
+        if not (0 <= start < end <= duration + 1e-6):
+            raise ValueError("Evidence contains a non-positive or out-of-range interval")
+        interval = (round(start, 6), round(end, 6))
+        if interval in intervals:
+            raise ValueError("Evidence contains a duplicate interval")
+        intervals.add(interval)
+        if start < previous_end - 1e-6:
+            raise ValueError("Evidence contains overlapping canonical intervals")
+        previous_end = end
+        for part in row.get("alternative_sources", []):
+            key = (part.get("segment_index"), part.get("word_index"))
+            if key in owned:
+                raise ValueError("A hypothesis token has more than one owner")
+            owned.add(key)
+
+
+def consensus_for_row(row: dict) -> dict:
+    """Keep agreed prefix/suffix and isolate only the unresolved span."""
+    candidates = []
+    for source, value in (("primary", row.get("text")), ("enhanced", row.get("alternative")),
+                          ("recovery", usable_retry_text(row))):
+        text = normalize(str(value or ""))
+        if text and text != "[نامفهوم]" and not set(text_flags(text)) & {"repetition", "compression"}:
+            candidates.append({"source": source, "text": text})
+    groups: dict[str, list[dict]] = {}
+    for candidate in candidates:
+        groups.setdefault(candidate["text"], []).append(candidate)
+    agreed = max(groups.values(), key=len, default=[])
+    if len(agreed) >= 2:
+        sensitive = bool(re.search(r"\d|تومان|ریال|درصد|شماره|کد|تاریخ", agreed[0]["text"]))
+        providers = {str(row.get("primary_provider", "")), str(row.get("alternative_provider", ""))} - {""}
+        families = {"whisper" if "whisper" in provider else provider for provider in providers}
+        probabilities = [float(word["probability"])
+                         for word in (row.get("words") or []) + row.get("alternative_sources", [])
+                         if isinstance(word.get("probability"), (int, float))]
+        acoustic_support = len(probabilities) >= 2 and sum(probabilities) / len(probabilities) >= .65
+        if sensitive and len(families) < 2 and not acoustic_support:
+            guarded = re.sub(r"\d+", "[نامفهوم]", agreed[0]["text"])
+            return {"consensus_text": guarded, "confidence_tier": "unresolved",
+                    "uncertainty_spans": [{"text": agreed[0]["text"],
+                                           "reason": "sensitive_requires_independent_evidence"}],
+                    "candidate_sources": [item["source"] for item in agreed],
+                    "reason": "sensitive_requires_independent_evidence"}
+        return {"consensus_text": agreed[0]["text"], "confidence_tier": "high",
+                "uncertainty_spans": [], "candidate_sources": [item["source"] for item in agreed],
+                "reason": "two_valid_hypotheses_agree"}
+    if not candidates:
+        return {"consensus_text": "[نامفهوم]", "confidence_tier": "unresolved",
+                "uncertainty_spans": [{"text": "[نامفهوم]", "reason": "no_usable_decode"}],
+                "candidate_sources": [], "reason": "no_usable_decode"}
+    if len(candidates) == 1:
+        retry_segments = (row.get("retry") or {}).get("segments") or []
+        aligned = any(float(segment.get("alignment_coverage") or 0) >= .8 for segment in retry_segments)
+        source_words = (retry_segments[0].get("words", []) if candidates[0]["source"] == "recovery" and retry_segments
+                        else row.get("words") or [])
+        probabilities = [float(word["probability"]) for word in source_words
+                         if isinstance(word.get("probability"), (int, float))]
+        strong = aligned or (len(probabilities) >= 2 and sum(probabilities) / len(probabilities) >= .7)
+        return {"consensus_text": candidates[0]["text"], "confidence_tier": "medium" if strong else "low",
+                "uncertainty_spans": [], "candidate_sources": [candidates[0]["source"]],
+                "reason": "strong_acoustic_alignment" if strong else "single_valid_hypothesis"}
+    left, right = candidates[0]["text"].split(), candidates[1]["text"].split()
+    prefix = 0
+    while prefix < min(len(left), len(right)) and left[prefix] == right[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix < min(len(left) - prefix, len(right) - prefix) and left[-1 - suffix] == right[-1 - suffix]:
+        suffix += 1
+    left_middle = left[prefix:len(left) - suffix if suffix else len(left)]
+    right_middle = right[prefix:len(right) - suffix if suffix else len(right)]
+    sensitive = bool(re.search(r"\d|تومان|ریال|درصد|شماره|کد|تاریخ", " ".join(left_middle + right_middle)))
+    output = left[:prefix] + ["[نامفهوم]"] + (left[len(left) - suffix:] if suffix else [])
+    reason = "sensitive_disagreement" if sensitive else "hypothesis_disagreement"
+    return {"consensus_text": " ".join(output), "confidence_tier": "unresolved",
+            "uncertainty_spans": [{"text": " ".join(left_middle),
+                                   "candidates": [" ".join(left_middle), " ".join(right_middle)],
+                                   "reason": reason}],
+            "candidate_sources": [item["source"] for item in candidates], "reason": reason}
 
 
 def timed_units(segments: list[dict], max_seconds: float = 8) -> list[dict]:
@@ -293,16 +407,62 @@ def build_evidence(raw: dict, enhanced: dict, duration: float, speech: list[dict
                 and math.isfinite(start + end) and 0 <= start < duration
                 and (end >= start if allow_point else end > start))
 
-    enhanced_units = [item for item in enhanced.get("segments", []) if valid(item)]
-    for index, item in enumerate(timed_units(raw.get("segments", []))):
+    enhanced_segments = enhanced.get("segments", [])
+    quarantined_enhanced = [item for item in enhanced_segments if segment_is_quarantined(item, duration)]
+    enhanced_units = [item for item in enhanced_segments if valid(item) and item not in quarantined_enhanced]
+    raw_units = []
+    for item in raw.get("segments", []):
+        if segment_is_quarantined(item, duration):
+            if not str(item.get("text", "")).strip() and item.get("start") == item.get("end"):
+                continue
+            start = item.get("start") if isinstance(item.get("start"), (int, float)) else 0.0
+            end = item.get("end") if isinstance(item.get("end"), (int, float)) else start + .001
+            start = min(max(0.0, float(start)), max(0.0, duration - .001))
+            end = min(duration, max(start + .001, float(end)))
+            raw_units.append(dict(item, start=start, end=end, text="[نامفهوم]", words=[],
+                                  flags=segment_timing_flags(item, duration) + ["failed_decode"]))
+        else:
+            raw_units.extend(timed_units([item]))
+    previous_end = 0.0
+    for index, item in enumerate(sorted(raw_units, key=lambda value: (value.get("start", 0), value.get("end", 0)))):
         if not valid(item):
             continue
-        start, end = float(item["start"]), min(float(item["end"]), duration)
+        start, end = max(previous_end, float(item["start"])), min(float(item["end"]), duration)
+        if end <= start:
+            if rows:
+                rows[-1]["flags"] = sorted(set(rows[-1]["flags"] + ["invalid_timeline", "failed_decode"]))
+            continue
+        previous_end = end
         original = item["text"].strip()
         flags = text_flags(original, item)
         rows.append({"id": f"s{index + 1}", "start": start, "end": end,
                      "text": original, "alternative": "", "flags": flags,
-                     "speaker": "گوینده نامشخص", "words": aligned_words(item), "alternative_sources": []})
+                     "speaker": "گوینده نامشخص", "words": aligned_words(item), "alternative_sources": [],
+                     "primary_provider": raw.get("provider") or raw.get("backend"),
+                     "alternative_provider": enhanced.get("provider") or enhanced.get("backend")})
+
+    # Never allocate tokens from a corrupt decoder segment. Its entire interval
+    # is one evidence unit (or a flag on existing primary evidence), regardless
+    # of how many zero-duration words the decoder emitted.
+    for source_index, item in enumerate(quarantined_enhanced):
+        try:
+            start = max(0.0, min(duration, float(item.get("start", 0))))
+            end = max(start, min(duration, float(item.get("end", start))))
+        except (TypeError, ValueError):
+            continue
+        touched = [row for row in rows if max(0.0, min(end, row["end"]) - max(start, row["start"])) > 0]
+        flags = sorted(set(segment_timing_flags(item, duration) + ["failed_decode"]))
+        if touched:
+            for row in touched:
+                row["flags"] = sorted(set(row["flags"] + flags))
+        elif end > start:
+            rows.append({"id": "", "start": start, "end": end, "text": "[نامفهوم]",
+                         "alternative": str(item.get("text", "")).strip(), "flags": flags,
+                         "speaker": "گوینده نامشخص", "words": [],
+                         "alternative_sources": [{"segment_index": source_index, "word_index": None,
+                                                   "start": start, "end": end,
+                                                   "text": str(item.get("text", "")).strip()}],
+                         "failed_decode_source": source_index})
 
     def overlap(left, right):
         return max(0., min(left["end"], right["end"]) - max(left["start"], right["start"]))
@@ -322,6 +482,16 @@ def build_evidence(raw: dict, enhanced: dict, duration: float, speech: list[dict
                                        | {"alternative_timing_uncertain"}))
             rows = [row for row in rows if row not in touched] + [merged]
     rows.sort(key=lambda row: (row["start"], row["end"]))
+    disjoint = []
+    for row in rows:
+        if disjoint and row["start"] < disjoint[-1]["end"]:
+            if row.get("failed_decode_source") is not None:
+                disjoint[-1]["flags"] = sorted(set(disjoint[-1]["flags"] + row["flags"]))
+                continue
+            row["start"] = disjoint[-1]["end"]
+        if row["end"] > row["start"]:
+            disjoint.append(row)
+    rows = disjoint
     canonical = list(rows)
     for source_index, item in enumerate(enhanced_units):
         words = aligned_words(item)
@@ -356,7 +526,8 @@ def build_evidence(raw: dict, enhanced: dict, duration: float, speech: list[dict
                 owner["end"] = min(duration, atom["end"])
             owner["alternative_sources"].append({"segment_index": source_index,
                 "word_index": word_index if words else None, "start": atom["start"],
-                "end": atom["end"], "text": atom["word"]})
+                "end": atom["end"], "text": atom["word"],
+                "probability": atom.get("probability")})
             if "prompt_leakage" in item.get("flags", []):
                 owner["flags"].append("alternative_prompt_leakage")
     for row in rows:
@@ -414,7 +585,9 @@ def build_evidence(raw: dict, enhanced: dict, duration: float, speech: list[dict
     # Assign ids only after all gap rows have been inserted.
     for index, row in enumerate(rows):
         row["id"] = f"s{index + 1}"
-    return {"schema_version": 1, "duration_seconds": duration, "segments": rows,
+        row.update(consensus_for_row(row))
+    validate_timeline(rows, duration)
+    return {"schema_version": 2, "duration_seconds": duration, "segments": rows,
             "speech_regions": speech, "quality_status": "needs_review"}
 
 
@@ -503,13 +676,28 @@ def validate_review(value: dict, evidence: dict) -> list[dict]:
             row["uncertain"] = True
         originals = set(re.findall(r"\d+", normalize(row["raw_text"] + " " + row["alternative"]
                                                     + " " + (usable_retry_text(row) or ""))))
-        if any(number not in originals for number in re.findall(r"\d+", normalize(text))):
+        unsupported = {number for number in re.findall(r"\d+", normalize(text)) if number not in originals}
+        if unsupported:
             row["flags"].append("unsupported_number")
             row["uncertain"] = True
+            # Fail closed at the token span: retain supported surrounding text,
+            # but never publish a plausible-looking number with no ASR source.
+            text = re.sub(r"\d+", lambda match: "[نامفهوم]" if normalize(match.group()) in unsupported else match.group(), text)
+            row["text"] = text
         if entry["uncertain"] and "[نامفهوم]" not in text:
             row["flags"].append("uncertain_wording")
         if SequenceMatcher(None, normalize(row["raw_text"]), normalize(text)).ratio() < .25:
             row["flags"].append("large_revision")
+        unresolved = [
+            {"start_char": match.start(), "end_char": match.end(),
+             "text": match.group(), "reason": "review_unresolved"}
+            for match in re.finditer(r"\[نامفهوم\]", text)
+        ]
+        row["uncertainty_spans"] = unresolved or list(row.get("uncertainty_spans") or [])
+        row["confidence_tier"] = "unresolved" if unresolved else (
+            "low" if row["uncertain"] else str(row.get("confidence_tier") or "medium"))
+        row["candidate_sources"] = list(row.get("candidate_sources") or [])
+        row["reason"] = "review_unresolved" if unresolved else str(row.get("reason") or "reviewed")
         result.append(row)
     if seen != set(source):
         raise ValueError("Review omitted evidence segments")

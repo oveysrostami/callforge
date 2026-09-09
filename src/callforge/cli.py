@@ -11,7 +11,7 @@ from callforge.config import AppConfig
 from callforge.db import Database
 from callforge.registry import get_active_root, set_active_root
 from callforge.scanner import scan
-from callforge.setup_tools import checks, setup, speaker_check
+from callforge.setup_tools import checks, setup, speaker_check, quality_checks
 from callforge.worker import run_batch
 from callforge.web import serve_ui
 from callforge.evaluation import sample_calls, score, transcript_text
@@ -28,6 +28,9 @@ def workspace(directory: str | None = None) -> tuple[AppConfig, Database]:
     root = Path(directory) if directory is not None else get_active_root()
     config = AppConfig.for_root(root)
     config.ensure()
+    # ensure() may have migrated an older config; use the effective v2 values
+    # immediately rather than waiting for the next command invocation.
+    config = AppConfig.for_root(root)
     database = Database(config.database)
     database.initialize()
     return config, database
@@ -47,7 +50,7 @@ def command_init(args) -> int:
     print(f"Initialized {config.workspace}")
     print(f"Active audio directory: {config.root}")
     print(
-        f"Indexed {result.discovered} MP3 files; skipped_zero_duration={result.skipped}; "
+        f"Indexed {result.discovered} audio files; skipped={result.skipped}; collisions={result.collisions}; "
         f"{result.imported_markdown} existing Markdown transcripts imported."
     )
     return 0
@@ -59,7 +62,7 @@ def command_scan(args) -> int:
     set_active_root(config.root)
     print(f"Active audio directory: {config.root}")
     print(
-        f"Indexed {result.discovered} MP3 files; changed={result.changed}, "
+        f"Indexed {result.discovered} audio files; changed={result.changed}, collisions={result.collisions}, "
         f"metadata_errors={result.metadata_errors}, skipped_zero_duration={result.skipped}, "
         f"imported_markdown={result.imported_markdown}."
     )
@@ -241,7 +244,7 @@ def command_benchmark_freeze(args) -> int:
     directory = config.workspace / "benchmarks"
     directory.mkdir(exist_ok=True)
     output = Path(args.output).expanduser().resolve() if args.output else directory / f"audio-{args.audio_id}.json"
-    value = freeze_reference(database, args.audio_id, output)
+    value = freeze_reference(database, args.audio_id, output, split=args.split)
     print(json.dumps({"benchmark": str(output), "reference_version": value["reference"]["version"],
                       "text": value["baseline_text_score"], "speaker": value["baseline_speaker_score"]}, ensure_ascii=False, indent=2))
     return 0
@@ -252,7 +255,12 @@ def command_benchmark_asr(args) -> int:
     config = AppConfig.for_root(get_active_root())  # No database writes or publication.
     report = run_comparison(config, [Path(p).expanduser().resolve() for p in args.reference],
                             Path(args.output).expanduser().resolve(), args.model,
-                            temperatures=args.temperature, seed=args.seed, context_prompt=not args.no_context_prompt)
+                            temperatures=args.temperature, seed=args.seed,
+                            providers=args.provider,
+                            prompt_modes=["off"] if args.no_context_prompt else args.prompt_mode,
+                            audio_variants=args.audio_variant, repeats=args.repeats,
+                            holdout_references=[Path(p).expanduser().resolve() for p in args.holdout_reference]
+                            if args.holdout_reference else None)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["status"] == "completed" else 1
 
@@ -324,7 +332,7 @@ def command_setup(args) -> int:
         if not sys.stdin.isatty():
             raise ValueError("Use callforge setup --yes to install, or --check for a read-only check. Tokens require an interactive terminal.")
         install = input("Install dependencies and download local Whisper/speaker models? [Y/n]: ").strip().lower() not in {"n", "no"}
-    return 0 if print_checks(setup(install, args.force_skill)) else 1
+    return 0 if print_checks(setup(install, args.force_skill, quality_models=args.quality_models)) else 1
 
 
 def command_setup_diarization(args) -> int:
@@ -345,16 +353,18 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--force-skill", action="store_true", help="Back up and replace the installed skill")
     setup_parser.add_argument("--diarization", action="store_true", help="Compatibility option: speaker models are now included by default")
     setup_parser.add_argument("--check", action="store_true", help="Read-only readiness check; no installation or login")
+    setup_parser.add_argument("--quality-models", action="store_true",
+                              help="Explicitly install/cache full Whisper and optional Qwen candidates")
     setup_parser.set_defaults(func=command_setup)
 
     doctor = subparsers.add_parser("doctor", help="Check the local runtime")
-    doctor.set_defaults(func=lambda args: 0 if print_checks(checks() + [speaker_check()]) else 1)
+    doctor.set_defaults(func=lambda args: 0 if print_checks(checks() + [speaker_check()] + quality_checks()) else 1)
 
     init = subparsers.add_parser("init", help="Initialize and index an audio directory")
     init.add_argument("directory")
     init.set_defaults(func=command_init)
 
-    scan_parser = subparsers.add_parser("scan", help="Discover MP3 files and update metadata")
+    scan_parser = subparsers.add_parser("scan", help="Discover MP3/WAV/M4A/FLAC/OGG files and update metadata")
     scan_parser.add_argument("directory")
     scan_parser.add_argument("--no-import-markdown", action="store_true")
     scan_parser.set_defaults(func=command_scan)
@@ -383,14 +393,22 @@ def build_parser() -> argparse.ArgumentParser:
     freeze = subparsers.add_parser("benchmark-freeze", help="Freeze one current human-approved reference and its machine baseline")
     freeze.add_argument("--audio-id", required=True, type=positive_int)
     freeze.add_argument("--output", help="New JSON path; defaults to the active workspace benchmarks folder")
+    freeze.add_argument("--split", choices=("development", "holdout"), default="development")
     freeze.set_defaults(func=command_benchmark_freeze)
-    asr = subparsers.add_parser("benchmark-asr", help="Compare MLX Whisper models locally against frozen references; never publish")
+    asr = subparsers.add_parser("benchmark-asr", help="Compare offline ASR providers against frozen references; never publish")
     asr.add_argument("--reference", action="append", required=True, help="Frozen development JSON; repeat for multiple references")
-    asr.add_argument("--model", action="append", required=True, help="MLX model repository; downloads to the active cache if needed")
+    asr.add_argument("--holdout-reference", action="append", help="Frozen holdout JSON; only the development winner is evaluated")
+    asr.add_argument("--model", action="append", required=True, help="Model name or provider:model; must already be cached")
+    asr.add_argument("--provider", action="append", choices=("mlx-whisper", "faster-whisper", "qwen3-asr"))
     asr.add_argument("--output", required=True, help="New experiment directory; never overwritten")
     asr.add_argument("--temperature", type=float, action="append", help="Experimental fallback schedule; repeat")
-    asr.add_argument("--seed", type=int, help="Fix MLX sampling seed for controlled experiments")
-    asr.add_argument("--no-context-prompt", action="store_true", help="Experiment without the normal domain/glossary prompt")
+    asr.add_argument("--seed", type=int, default=42, help="Base seed; each repeat increments it")
+    asr.add_argument("--repeats", type=positive_int, default=3)
+    asr.add_argument("--prompt-mode", action="append", choices=("off", "domain", "glossary"),
+                     help="Repeat to benchmark modes; default is off")
+    asr.add_argument("--no-context-prompt", action="store_true", help=argparse.SUPPRESS)
+    asr.add_argument("--audio-variant", action="append", choices=("raw", "agc", "denoise"),
+                     help="Repeat to benchmark variants; denoise is never promoted implicitly")
     asr.set_defaults(func=command_benchmark_asr)
     speakers = subparsers.add_parser("benchmark-diarization", help="Run local speaker detection only, without publishing any transcript")
     speakers.add_argument("--benchmark", required=True)

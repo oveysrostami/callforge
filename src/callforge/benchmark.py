@@ -82,7 +82,9 @@ def speaker_score(reference: list[dict], hypothesis: list[dict]) -> dict:
             "note": "Not full DER; ignores unannotated audio and reference overlap. Assumes one person per reference role. Mapping is evaluation-only, not predicted customer/support roles."}
 
 
-def freeze_reference(database, audio_id: int, destination: Path) -> dict:
+def freeze_reference(database, audio_id: int, destination: Path, *, split: str = "development") -> dict:
+    if split not in {"development", "holdout"}:
+        raise ValueError("Reference split must be development or holdout")
     with database.connect() as connection:
         audio = connection.execute("SELECT * FROM audio_files WHERE id=?", (audio_id,)).fetchone()
         reference = connection.execute(
@@ -100,8 +102,10 @@ def freeze_reference(database, audio_id: int, destination: Path) -> dict:
     if file_hash(source) != reference["audio_content_hash"]:
         raise ValueError("Audio changed since human review")
     ref_data, base_data = json.loads(reference["data_json"]), json.loads(baseline["data_json"] or "{}")
+    baseline_text = transcript_text(baseline["content"], base_data)
+    baseline_tokens = max(1, len(baseline_text.split()))
     value = {"schema_version": 1, "created_at": datetime.now(UTC).isoformat(),
-             "callforge_version": __version__, "split": "development",
+             "callforge_version": __version__, "split": split,
              "audio_id": audio_id, "audio_path": str(source), "audio_sha256": reference["audio_content_hash"],
              "duration_seconds": audio["duration_seconds"], "direction": audio["direction"],
              "reference": {"transcript_id": reference["id"], "version": reference["version"],
@@ -109,7 +113,8 @@ def freeze_reference(database, audio_id: int, destination: Path) -> dict:
              "baseline": {"transcript_id": baseline["id"], "version": baseline["version"],
                           "content": baseline["content"], "segments": base_data.get("segments", [])},
              "baseline_text_score": score(transcript_text(reference["content"], ref_data),
-                                          transcript_text(baseline["content"], base_data)),
+                                          baseline_text),
+             "baseline_unresolved_token_rate": baseline_text.count("[نامفهوم]") / baseline_tokens,
              "baseline_speaker_score": speaker_score(ref_data.get("segments", []), base_data.get("segments", []))}
     # Immutable snapshots: reruns must choose a new name.
     with destination.open("x", encoding="utf-8") as handle:

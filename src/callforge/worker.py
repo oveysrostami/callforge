@@ -10,6 +10,7 @@ from pathlib import Path
 
 from callforge.codex_runner import CodexRunner
 from callforge.config import AppConfig
+from callforge.audio_files import sibling_audio_collision, transcript_path
 from callforge.db import Database
 from callforge.quality import ArtifactConflictError, file_hash
 from callforge.speaker_pipeline import SpeakerProcessingError
@@ -41,11 +42,17 @@ def process_job(
     try:
         if not audio_path.is_file():
             raise RuntimeError(f"Audio file disappeared: {audio_path}")
+        collision = sibling_audio_collision(audio_path)
+        if collision:
+            raise ArtifactConflictError(
+                "Transcript stem collision; no output published for: "
+                + ", ".join(str(path) for path in collision)
+            )
         with database.connect() as connection:
             expected_hash = connection.execute("SELECT content_sha256 FROM audio_files WHERE id=?", (job["audio_file_id"],)).fetchone()[0]
         if file_hash(audio_path) != expected_hash:
             raise RuntimeError("Audio changed since scan; scan the source again before transcription")
-        markdown_path = audio_path.with_suffix(".md")
+        markdown_path = transcript_path(audio_path)
         previous_markdown = None
         if markdown_path.is_file():
             previous_markdown = (

@@ -19,10 +19,18 @@ import numpy as np
 
 
 MLX_MODELS = {
-    "turbo": "mlx-community/whisper-large-v3-turbo-q4",
+    "turbo": "mlx-community/whisper-large-v3-turbo",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "turbo-q4": "mlx-community/whisper-large-v3-turbo-q4",
+    "large-v3-turbo-q4": "mlx-community/whisper-large-v3-turbo-q4",
     "full": "mlx-community/whisper-large-v3-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
 }
-FASTER_MODELS = {"turbo": "large-v3-turbo", "full": "large-v3"}
+FASTER_MODELS = {
+    "turbo": "large-v3-turbo", "large-v3-turbo": "large-v3-turbo",
+    "turbo-q4": "large-v3-turbo", "large-v3-turbo-q4": "large-v3-turbo",
+    "full": "large-v3", "large-v3": "large-v3",
+}
 
 
 def finite_json(value):
@@ -236,8 +244,10 @@ def main() -> int:
     else:
         text, segments, model = faster_transcribe(samples, args)
     output = {
+        "schema_version": 1,
         "audio": str(audio),
         "backend": backend,
+        "provider": f"{backend}-whisper" if backend != "faster" else "faster-whisper",
         "model": model,
         "resolved_model_path": getattr(args, "resolved_model_path", None),
         "language": args.language,
@@ -251,6 +261,10 @@ def main() -> int:
                      "condition_on_previous_text": False, "vad_mode": "coverage_only",
                      "decoder_numerics_guard": backend == "mlx",
                      "vad_threshold": .35, "prompt": args.prompt},
+        "provenance": {"provider": f"{backend}-whisper" if backend != "faster" else "faster-whisper",
+                       "model": model, "backend": backend, "offline": True},
+        "metrics": {"segment_count": len(segments),
+                    "word_count": sum(len(row.get("words", [])) for row in segments)},
         "runtime_versions": {name: importlib.metadata.version(name) for name in
                              ("numpy", "faster-whisper", "onnxruntime") + (("mlx-whisper",) if backend == "mlx" else ())},
     }

@@ -1,11 +1,11 @@
 ---
 name: pbx-call-transcriber
-description: Transcribe Persian PBX MP3 call recordings locally with Whisper, improve quiet telephone audio, compare independent passes, reconstruct speaker turns, and save a reviewed same-name Markdown transcript beside the source. Use for PBX recordings whose names commonly begin with external-, internal-, or out-. Do not use for general audio editing or summaries without transcription.
+description: Transcribe Persian audio locally from MP3, WAV, M4A, FLAC, or OGG with an evidence-grounded ASR cascade and save a reviewed same-name Markdown transcript. PBX filenames are optional metadata. Do not use for general audio editing or summaries without transcription.
 ---
 
 # PBX Call Transcriber
 
-Transcribe the requested recording locally. In standalone mode save a same-name Markdown transcript beside the MP3. In managed mode return structured segment corrections; CallForge preserves evidence, renders Markdown, and stores versions in its database. Machine-reviewed is not human-approved.
+Transcribe the requested recording locally. In standalone mode save a same-name Markdown transcript beside the audio. In managed mode return structured segment corrections; CallForge preserves evidence, renders Markdown, and stores versions in its database. Machine-reviewed is not human-approved.
 
 ## Privacy and accuracy rules
 
@@ -30,7 +30,8 @@ When the request supplies prepared JSON paths and a canonical evidence timeline,
 - do not run audio preparation or Whisper again;
 - do not inspect, install, repair, download, or benchmark runtimes or models;
 - do not write files, create extra artifacts, or claim to have listened to the source audio;
-- resolve disagreements from the two supplied passes when possible and use `[نامفهوم]` otherwise.
+- prefer high-tier consensus, preserve agreed prefix/suffix, and put `[نامفهوم]` only over the unresolved span;
+- accept ordinary words with two valid hypotheses or strong alignment. Require two model families or sufficient acoustic evidence for numbers, amounts, dates, names and identifiers;
 - include every canonical segment id exactly once, retaining complete wording without summarization; put unresolved speech in `[نامفهوم]`, set `uncertain=true`, and explain the unresolved difference in `notes`;
 - enhanced alternatives are partitioned between review units; do not repeat one unit's alternative in its neighbors. `alternative_timing_uncertain` marks a joint unit with unavailable word timing, not automatically unintelligible speech;
 - do not alter timing or omit a segment because it is repetitive or difficult; describe confirmed non-speech explicitly and flag uncertain non-speech decisions;
@@ -42,15 +43,12 @@ When the request supplies prepared JSON paths and a canonical evidence timeline,
 
 Use this workflow only when CallForge-managed JSON inputs were not supplied.
 
-1. Resolve the absolute MP3 path and the exact sibling Markdown path.
+1. Resolve the supported audio path and exact sibling Markdown path. Refuse same-stem audio collisions.
 2. Inspect duration and filename metadata. Reject a missing or empty source.
 3. Create an isolated temporary working directory. Do not place intermediate WAV or JSON files beside the source.
 4. Run `scripts/prepare_audio.py SOURCE --output-dir TEMP`. It creates a conservative 16 kHz mono decode and an AGC copy and reports signal statistics.
-5. Run two complementary (not statistically independent) transcription passes with `scripts/transcribe_audio.py`:
-   - turbo model on the raw 16 kHz WAV;
-   - turbo model on the AGC WAV.
-   - for Persian calls, pass the neutral context prompt `این یک مکالمه تلفنی فارسی میان مشتری و کارشناس پشتیبانی است.` and append glossary terms only as possible spellings; reject any decoder output that merely echoes this prompt.
-6. Compare segment timing and wording. For disagreements, low-confidence segments, names, phone numbers, money, or identifiers, use `[نامفهوم]` unless the user explicitly requested full-model review. Never download the full model implicitly.
+5. Use non-Q4 Turbo on raw audio. Use adaptive AGC only for quiet windows and full large-v3 only for unresolved spans. Context prompt is off by default; glossary terms are spelling normalization only.
+6. Quarantine repetition, compression, invalid timestamp and truncation before word allocation. Never expand a zero-duration token loop over the decoder interval. Never download a model during transcription.
 7. Reconstruct speaker turns conservatively. Telephone recordings may be mono; do not pretend speaker diarization is certain.
 8. Read the final text from start to finish and remove Whisper hallucinations caused by silence, repeated fragments, and impossible continuations.
 9. Write the final UTF-8 Markdown atomically to the exact sibling path. Ensure it is non-empty, then delete temporary files.
@@ -81,7 +79,7 @@ Preserve segment timestamps for replay and review. Mark the document as requirin
 
 Before finishing, verify all of these:
 
-- the MP3 still exists and was not modified;
+- the source audio still exists and was not modified;
 - the sibling `.md` has exactly the source stem;
 - the Markdown includes `## مکالمه` and actual dialogue;
 - uncertain content is marked `[نامفهوم]`;

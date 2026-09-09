@@ -135,10 +135,10 @@ print(json.dumps({
     agc = json.loads(prepared.agc_transcript_path.read_text(encoding="utf-8"))
     assert raw["hf_home"] == agc["hf_home"] == str(config.models.resolve())
     assert raw["python"] == agc["python"] == sys.executable
-    assert "مکالمه تلفنی فارسی" in raw["prompt"]
+    assert raw["prompt"] == ""
     events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert events[0]["stage"] == "prepare_audio"
-    assert any(event["stage"] == "model_download" for event in events)
+    assert not any(event["stage"] == "model_download" for event in events)
     assert events[-1]["stage"] == "whisper"
     assert events[-1]["state"] == "completed"
     assert (work / "evidence.json").is_file()
@@ -186,10 +186,12 @@ else:
     result = json.loads((work / "evidence.json").read_text(encoding="utf-8"))
     assert result["coverage_recovery"] == {
         "requested_windows": 1, "completed_windows": 1,
-        "recovered_segments": 1, "remaining_segments": 0, "audio_variant": "raw",
+        "recovered_segments": 1, "remaining_segments": 0,
+        "audio_variant": "window_quality_selection",
+        "cascade": ["mlx-whisper:large-v3-turbo", "mlx-whisper:large-v3"],
     }
     assert result["segments"][0]["retry"]["text"] == "سلام دنیا"
-    assert (work / "coverage-1.json").is_file()
+    assert (work / "coverage-1-0-raw.json").is_file()
     events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert any(event["stage"] == "whisper_coverage" and event["state"] == "completed"
                for event in events)

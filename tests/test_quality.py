@@ -62,6 +62,7 @@ def test_review_retains_numbers_flags_and_canonical_time():
     assert rows[1]["start"] == 3
     assert "unsupported_number" in rows[1]["flags"]
     assert rows[1]["uncertain"] is True
+    assert "۹۰۰" not in rows[1]["text"] and "[نامفهوم]" in rows[1]["text"]
     assert rows[1]["raw_text"] == "مبلغ ۲۰۰ تومان"
     assert "نیازمند بازبینی انسانی" in render_markdown("test.mp3", rows)
 

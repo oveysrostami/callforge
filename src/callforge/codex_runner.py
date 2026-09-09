@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from callforge.config import AppConfig
+from callforge.audio_files import transcript_path
 from callforge import __version__
 from callforge.local_transcriber import LocalWhisperPipeline, PreparedTranscription
 from callforge.quality import ArtifactConflictError, build_evidence, compact_review_input, file_hash, render_markdown, review_schema, validate_review, write_json
@@ -54,9 +55,12 @@ class CodexRunner:
         return (
             f"Use ${self.config.skill_name} in CallForge-managed review mode for this call: "
             f"{quoted_audio}\n\n"
-            "CallForge has already completed local audio preparation and both Whisper turbo passes. "
+            "CallForge has already completed the local max-quality ASR cascade. "
             f"Read the complete compact review input at {quoted_input}. "
             "It includes the canonical timeline, raw text, enhanced alternatives, contextual coverage recovery, and selective retry text. "
+            "consensus_text preserves agreed prefix/suffix and places [نامفهوم] only on an unresolved span. "
+            "Prefer a high-tier consensus. Ordinary wording needs two valid hypotheses or strong alignment; "
+            "numbers, amounts, dates, names and identifiers require agreement across model families or sufficient acoustic evidence. "
             "Each enhanced word or unsplittable phrase belongs to one review unit only. "
             "Do not repeat its wording in neighboring units. alternative_timing_uncertain means a joint unit "
             "was needed because word-level timing was unavailable, not that the speech is unintelligible. "
@@ -238,7 +242,7 @@ class CodexRunner:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("", encoding="utf-8")
         stderr_path.write_text("", encoding="utf-8")
-        markdown_path = audio_path.with_suffix(".md")
+        markdown_path = transcript_path(audio_path)
         original_audio_hash = file_hash(audio_path)
         original_markdown_hash = self._file_digest(markdown_path)
         # Durable per-run evidence; disposable decoded audio is removed in finally.

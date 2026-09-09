@@ -291,7 +291,8 @@ def make_handler(
                 return
             length = end - start + 1
             self.send_response(HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK)
-            self.send_header("Content-Type", "audio/mpeg")
+            from callforge.audio_files import audio_mime_type
+            self.send_header("Content-Type", audio_mime_type(resolved))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(length))
             self.send_header("Cache-Control", "private, max-age=3600")

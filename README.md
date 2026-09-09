@@ -1,16 +1,16 @@
 # CallForge
 
-CallForge یک ابزار خط فرمان محلی و قابل‌ادامه برای ایندکس‌کردن فایل‌های MP3 و اجرای transcription با Codex و Whisper است. نام پروژه وابسته به نام پوشه یا PBX خاصی نیست و می‌توان هر دایرکتوری صوتی را به آن داد.
+CallForge یک pipeline محلی و قابل‌ادامه برای transcription فارسی فایل‌های `MP3/WAV/M4A/FLAC/OGG` است. نام پروژه وابسته به PBX خاصی نیست و می‌توان هر دایرکتوری صوتی را به آن داد.
 
 ## قابلیت‌ها
 
-- جست‌وجوی بازگشتی همهٔ فایل‌های `.mp3` با پشتیبانی از حروف بزرگ و کوچک
+- جست‌وجوی بازگشتی پنج فرمت پشتیبانی‌شده با پسوند case-insensitive و جلوگیری fail-closed از collision هم‌نام
 - استخراج hash، زمان و اندازهٔ فایل، مشخصات صوت و متادیتای نام تماس
 - صف پایدار SQLite با retry، lease و تاریخچهٔ هر اجرا
 - پردازش batch و اجرای هم‌زمان چند Codex worker
-- اجرای مستقیم دو پاس Whisper با runtime نصب‌شده و cache پایدار مدل
+- اجرای primary غیر-Q4، fallback کامل و provider جایگزین فقط روی spanهای حل‌نشده
 - استفاده از Codex فقط برای مقایسهٔ خروجی‌ها، بازسازی نوبت‌های گفتگو و تولید Markdown
-- ساخت Markdown هم‌نام کنار MP3
+- ساخت Markdown هم‌نام کنار فایل صوتی
 - ذخیرهٔ کامل همان Markdown به‌صورت نسخه‌دار در دیتابیس و رابطهٔ مستقیم با فایل صوتی
 - واردکردن خودکار Markdownهای قبلی هنگام scan
 - UI فارسی روی localhost برای جست‌وجو، مشاهدهٔ متادیتا، پخش صوت و خواندن transcript
@@ -49,6 +49,7 @@ irm https://raw.githubusercontent.com/oveysrostami/callforge/main/scripts/instal
 callforge setup             # راهنمای تعاملی؛ نیازی به init یا دایرکتوری صوتی ندارد
 callforge setup --yes       # نصب بدون سؤال اولیه؛ ورود توکن همچنان مخفی و تعاملی است
 callforge setup --check     # فقط بررسی وضعیت، بدون نصب یا ورود
+callforge setup --yes --quality-models # دانلود صریح full Whisper و candidateهای Qwen؛ تنها مسیر دانلود آن‌ها
 ```
 
 اگر دسترسی آماده نباشد، setup همین لینک‌ها را نمایش می‌دهد:
@@ -179,6 +180,17 @@ whisper_model = "turbo"
 whisper_retry_model = "turbo"
 whisper_retry_segments = 3
 whisper_retry_seconds = 120
+transcription_profile = "max_quality_v2"
+asr_primary = "mlx-whisper:large-v3-turbo"
+asr_fallback = "mlx-whisper:large-v3"
+asr_alternative = "" # فقط پس از promotion benchmark مقدار بگیرد
+asr_context_prompt = false
+audio_enhancement = "adaptive"
+recovery_min_seconds = 8
+recovery_max_seconds = 15
+recovery_expand_seconds = 30
+recovery_context_seconds = 2
+asr_heavy_concurrency = 1
 glossary = ["ونسی", "بلوبانک", "بیت‌پین"] # اختیاری؛ فقط راهنمای املا
 diarization = true
 diarization_timeout_seconds = 180
@@ -207,23 +219,28 @@ audio_files 1 ─── * jobs 1 ─── * processing_runs
 برای مقایسهٔ آزمایشی مدل‌های MLX روی Apple Silicon، ابتدا با `benchmark-freeze` مرجع انسانی را ثابت کنید و سپس اجرا کنید:
 
 ```bash
-callforge benchmark-asr --reference /absolute/path/reference.json \
-  --model mlx-community/whisper-large-v3-turbo-q4 \
-  --model mlx-community/whisper-large-v3-turbo \
+callforge setup --yes --quality-models
+callforge benchmark-asr --reference /absolute/path/dev.json \
+  --holdout-reference /absolute/path/holdout.json \
+  --model mlx-whisper:large-v3-turbo \
+  --model mlx-whisper:large-v3 \
+  --model qwen3-asr:Qwen3-ASR-0.6B \
+  --prompt-mode off --audio-variant raw --audio-variant agc \
+  --repeats 3 --seed 42 \
   --output /absolute/path/new-experiment
 ```
 
-`--reference` برای چند تماس تکرارپذیر است. مدل لازم در cache فعال دریافت می‌شود؛ زمان دانلود از سنجش پردازش جداست و revision در مسیر snapshot ثبت می‌شود. هر دو مدل با همان صدای خام/AGC و تنظیمات decode اجرا می‌شوند. متن انسانی فقط وارد امتیازدهی می‌شود، نه prompt مدل. گزارش WER/CER مربوط به **خروجی ASR قبل از بازبینی Codex** است؛ شمارش عدد، حروف عدد را معادل رقم نمی‌گیرد. این آزمایش فقط فایل‌های خروجی جدید می‌سازد؛ دیتابیس، متن تأییدشده، MP3/Markdown و مدل پیش‌فرض را تغییر نمی‌دهد. نتایج سه نمونهٔ توسعه تضمین کیفیت تماس‌های جدید نیستند.
+`benchmark-asr` کاملاً offline است و در runtime دانلود نمی‌کند. ۳۰ مرجع development برای انتخاب و ۱۰ holdout فقط برای candidate برنده استفاده می‌شوند. متن مرجع فقط وارد scorer می‌شود، نه prompt یا inference. هر candidate حداقل سه اجرای seedدار دارد و source audio، Markdown، reference و دیتابیس immutable می‌مانند. Qwen با runtime جداگانهٔ Python 3.12 اجرا و فقط با پوشش CTC فارسی حداقل ۸۰٪ پذیرفته می‌شود؛ نبود backend، OOM یا crash همان candidate را `unsupported` می‌کند.
 
-هر worker با Python محیط نصب‌شدهٔ CallForge صوت را محلی decode می‌کند. تقویت صدا خطی، محدود به قله و فقط برای بخش‌های کم‌صداست؛ ورودی خام همیشه حفظ می‌شود. دو پاس مکمل Whisper (نه مستقل آماری) روی صدای خام و تقویت‌شده اجرا می‌شوند. برای فارسی یک prompt خنثی فقط زبان و نوع مکالمه را تثبیت می‌کند و واژه‌های glossary صرفاً به‌عنوان راهنمای املا به آن افزوده می‌شوند. هر دو backend زمان کلمات، معیارهای تشخیصی و VAD یکسان Silero را نگه می‌دارند. VAD برای پیدا کردن شکاف گفتار است، نه حذف قطعی صدای آهسته.
+هر worker صوت را محلی decode می‌کند و کانال‌ها را حفظ می‌کند. کانال‌های مستقل جداگانه transcribe و زمانی merge می‌شوند؛ در غیر این صورت downmix مرجع است. raw همیشه مرجع اصلی می‌ماند و AGC تنها برای صوت کم‌حجم ساخته/استفاده می‌شود. prompt پیش‌فرض خاموش است؛ glossary فقط راهنمای normalization املاست و منبع entity نیست. variant حذف نویز فقط در benchmark قابل آزمایش است.
 
-اگر VAD گفتار تشخیص دهد ولی هر دو پاس متن قابل‌استفاده نداشته باشند، CallForge شکاف‌های نزدیک را گروه‌بندی و در پنجرهٔ ۳۰ ثانیه‌ای دارای زمینه دوباره پردازش می‌کند؛ جمله‌های یک یا دو ثانیه‌ای جداگانه decode نمی‌شوند. متن بازیابی فقط با زمان کلمات به همان شکاف متصل می‌شود و خروجی دارای حلقه، معیار نامعتبر، فشردگی غیرعادی، احتمال سکوت، عدد کم‌اطمینان یا کپی prompt پذیرفته نمی‌شود. این بازیابی پیش از بازخوانی محدود سایر قسمت‌های مشکوک انجام می‌شود و مجموع هر دو همچنان به `whisper_retry_seconds` محدود است. صدای خام برای retry استفاده می‌شود مگر اینکه AGC شدت را دست‌کم ۲۰٪ بهتر کرده باشد.
+بازیابی روی پنجرهٔ VAD-aligned بین ۸ تا ۱۵ ثانیه با دو ثانیه context آغاز می‌شود و در شکست یک بار تا ۳۰ ثانیه گسترش می‌یابد. cascade به‌ترتیب Turbo بدون Q4، full large-v3 و candidate جایگزینِ promote‌شده است. raw/AGC با repetition، compression، logprob، timestamp و prompt leakage همان window انتخاب می‌شود. segment خراب پیش از word allocation قرنطینه می‌شود؛ zero-duration loop فقط یک failed-decode unit می‌سازد و timeline تکراری منتشر نمی‌شود.
 
 مهلت پیش‌فرض هر مرحلهٔ Whisper سی دقیقه، هر تلاش بازبینی Codex ده دقیقه و بی‌فعالیتی Codex دو دقیقه است. Codex در sandbox فقط‌خواندنی از skill همراه همان نسخهٔ برنامه استفاده می‌کند و خروجی JSON مطابق schema می‌دهد؛ اجازهٔ نصب و پردازش دوبارهٔ صوت ندارد. ورودی فشرده، متن کامل تماس و گزینه‌های جایگزین را بدون انبوه جزئیات کلمات نگه می‌دارد. پایان موفق فرایند، حضور تک‌تک بخش‌ها و باقی‌نماندن حلقه‌های تکراری خراب بررسی می‌شود. «فایل ده ثانیه ثابت مانده» معیار پایان نیست؛ تنظیم قدیمی `codex_artifact_grace_seconds` فقط برای سازگاری خوانده می‌شود.
 
 پس از timeout یا پاسخ ناقص، فقط بازبینی دوباره اجرا می‌شود؛ `codex_review_attempts` به‌صورت پیش‌فرض ۲ و قابل تنظیم از ۱ تا ۳ است. اگر همهٔ تلاش‌ها شکست بخورند، وضعیت پردازش «ناموفق» می‌شود؛ Markdown و نسخهٔ قبلی دیتابیس دست‌نخورده می‌مانند و هیچ پیش‌نویس خامی به‌عنوان متن نهایی منتشر نمی‌شود. شواهد و لاگ شکست در فایل و دیتابیس حفظ می‌شوند. این شکست باعث اجرای خودکار مجدد کل Whisper نمی‌شود. بازخوانی صوتی ابتدا به تکرارهای خراب و سپس سایر بخش‌های مشکوک اختصاص پیدا می‌کند.
 
-اجرای Codex به‌صورت پیش‌فرض با `codex_ignore_user_config` و `codex_ignore_rules` از تنظیمات نامرتبط جدا می‌شود. مدل از `codex_model` یا مدل سطح بالای تنظیمات Codex گرفته می‌شود. `whisper_model` و `whisper_retry_model` مقدار `turbo`، `full` یا شناسهٔ مدل سازگار با backend می‌پذیرند؛ انتخاب `full` دانلود مدل بزرگ‌تر را در اولین استفاده انجام می‌دهد. بدون تغییر تنظیمات، Full دانلود نمی‌شود. JSONها و مشخصات اجرا در `.callforge/runs` و دیتابیس نگه داشته می‌شوند؛ WAVهای موقت پس از اجرا پاک می‌شوند. لاگ‌ها در `.callforge/logs` باقی می‌مانند. خروجی ماشین، حتی در صورت موفقیت، همیشه نیازمند بازبینی انسانی است.
+کلیدهای قدیمی `whisper_model` و `whisper_retry_model` برای سازگاری خوانده می‌شوند، اما کلیدهای `asr_*` اولویت دارند و migration تکرارپذیر است. alias `turbo` اکنون non-Q4 است و `turbo-q4` صریح باقی مانده. runtime با `HF_HUB_OFFLINE=1` اجرا می‌شود؛ مدل‌های سنگین concurrency برابر ۱ دارند. transcriptهای موجود خودکار بازپردازش نمی‌شوند و انتشار جدید در شکست review/provider/speaker جای نسخهٔ قبلی را نمی‌گیرد.
 
 ## بازبینی انسانی و سنجش کیفیت
 

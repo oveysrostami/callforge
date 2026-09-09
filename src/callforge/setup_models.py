@@ -69,14 +69,41 @@ def whisper() -> None:
     print("Whisper and speech detector loaded successfully.", flush=True)
 
 
+def quality_models() -> None:
+    """Download every optional quality candidate; never called at runtime."""
+    import importlib.util
+    from contextlib import ExitStack
+    from pathlib import Path
+    helper = Path(__file__).parent / "resources/pbx-call-transcriber/scripts/transcribe_audio.py"
+    spec = importlib.util.spec_from_file_location("callforge_setup_quality_asr", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    print("Downloading/loading non-Q4 Turbo and full large-v3...", flush=True)
+    if module.choose_backend("auto") == "mlx":
+        from mlx_whisper.load_models import load_model
+        for name in ("turbo", "full"):
+            with ExitStack() as stack:
+                model, _ = module.compatible_mlx_model(module.MLX_MODELS[name], stack)
+                load_model(model)
+    else:
+        from faster_whisper import WhisperModel
+        for name in ("large-v3-turbo", "large-v3"):
+            WhisperModel(name, device="auto", compute_type="default")
+    from huggingface_hub import snapshot_download
+    for model in ("Qwen/Qwen3-ASR-0.6B", "Qwen/Qwen3-ASR-1.7B"):
+        print(f"Downloading optional benchmark candidate {model}...", flush=True)
+        snapshot_download(repo_id=model)
+    print("Quality model cache is ready.", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("access", "models", "whisper"))
+    parser.add_argument("mode", choices=("access", "models", "whisper", "quality-models"))
     args = parser.parse_args()
     try:
         if args.mode == "access":
             return access()
-        {"models": models, "whisper": whisper}[args.mode]()
+        {"models": models, "whisper": whisper, "quality-models": quality_models}[args.mode]()
         return 0
     except Exception:
         # Never print an exception that could contain credentials or signed URLs.
