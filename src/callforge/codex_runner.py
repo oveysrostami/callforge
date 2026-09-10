@@ -17,7 +17,9 @@ from callforge.config import AppConfig
 from callforge.audio_files import transcript_path
 from callforge import __version__
 from callforge.local_transcriber import LocalWhisperPipeline, PreparedTranscription
-from callforge.quality import ArtifactConflictError, build_evidence, compact_review_input, file_hash, render_markdown, review_schema, validate_review, write_json
+from callforge.quality import (ArtifactConflictError, build_evidence, compact_review_input,
+                               file_hash, render_markdown, review_schema,
+                               validate_publish_quality, validate_review, write_json)
 
 
 @dataclass(frozen=True)
@@ -59,8 +61,16 @@ class CodexRunner:
             f"Read the complete compact review input at {quoted_input}. "
             "It includes the canonical timeline, raw text, enhanced alternatives, contextual coverage recovery, and selective retry text. "
             "consensus_text preserves agreed prefix/suffix and places [نامفهوم] only on an unresolved span. "
-            "Prefer a high-tier consensus. Ordinary wording needs two valid hypotheses or strong alignment; "
+            "Treat consensus_text as the pipeline recommendation and prefer a high-tier consensus. "
+            "For medium-tier consensus preserve its supported meaning, but normalize obvious phonetic ASR "
+            "misspellings and colloquial Persian using the other hypothesis; do not copy garbled decoder "
+            "wording verbatim. For a low-tier single hypothesis, "
+            "keep any locally clear prefix or suffix and replace only its exact unresolved span, never the whole "
+            "segment merely because another hypothesis is absent. Ordinary wording needs two valid hypotheses or strong alignment; "
             "numbers, amounts, dates, names and identifiers require agreement across model families or sufficient acoustic evidence. "
+            "An entity_resolutions entry marked accepted is sufficient local Persian CTC acoustic evidence for that exact name span; "
+            "it may correct only the observed alias and must never introduce an entity into another span. "
+            "A rejected entity_candidates entry is not evidence for that name; keep its unresolved span [نامفهوم]. "
             "Each enhanced word or unsplittable phrase belongs to one review unit only. "
             "Do not repeat its wording in neighboring units. alternative_timing_uncertain means a joint unit "
             "was needed because word-level timing was unavailable, not that the speech is unintelligible. "
@@ -72,6 +82,7 @@ class CodexRunner:
             "Do not run Whisper, audio preparation, pip, package managers, virtualenv tools, or model downloads. "
             "Do not change HF_HOME and do not create another runtime. "
             "Do not summarize the call. Do not invent uncertain words; use [نامفهوم]. "
+            "Produce fluent, readable Persian wherever the acoustic hypotheses support the same meaning. "
             "Return ONLY the structured final response matching the supplied JSON schema. "
             "Include every evidence segment id exactly once; preserve its full meaning and do not summarize. "
             "Do not write or edit files. CallForge renders and publishes Markdown after validation. "
@@ -372,6 +383,18 @@ class CodexRunner:
                     review_error = str(exc)
                     returncode = returncode or 2
                     self._append_event(log_path, "review", "warning", f"بازبینی تلاش {attempt} معتبر نبود: {review_error}")
+            if review_error is None:
+                try:
+                    validate_publish_quality(reviewed)
+                except ValueError as exc:
+                    # Do not pressure a second language-model pass to guess
+                    # missing speech merely to satisfy the publication gate.
+                    review_error = str(exc)
+                    returncode = 2
+                    self._append_event(
+                        log_path, "review", "warning",
+                        "خروجی هنوز بیش از حد نامفهوم است؛ متن قبلی جایگزین نمی‌شود",
+                    )
             if file_hash(audio_path) != original_audio_hash:
                 raise RuntimeError("Source audio changed during transcription; no transcript published")
             quality = dict(evidence, segments=reviewed, review_error=review_error,

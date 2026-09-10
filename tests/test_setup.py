@@ -21,6 +21,7 @@ def test_global_setup_paths_work_before_init_and_preserve_legacy_cache(tmp_path)
     (config.models / "hub").mkdir()
     assert config.runtime_environment()["HF_HOME"] == str(config.models)
     assert speaker_runtime.environment(offline=True)["HF_HUB_OFFLINE"] == "1"
+    assert speaker_runtime.environment()["ORT_DISABLE_TELEMETRY"] == "1"
     assert speaker_runtime.environment()["DISABLE_SAFETENSORS_CONVERSION"] == "1"
 
 

@@ -9,9 +9,11 @@ import pytest
 from callforge.asr import ASRSpec, candidate_defects, choose_candidate, parse_spec
 from callforge.asr_benchmark import _promotion
 from callforge.audio_files import audio_mime_type, colliding_transcript_targets
-from callforge.config import AppConfig
+from callforge.config import AppConfig, GlossaryTerm
 from callforge.db import Database
 from callforge.evaluation import sample_calls
+from callforge.lexicon import (alignment_requests, apply_alignment,
+                               guard_unverified_entities, normalize_result)
 from callforge.quality import build_evidence, consensus_for_row, validate_timeline
 from callforge.scanner import discover_audio, scan
 
@@ -25,6 +27,31 @@ def test_zero_duration_decoder_loop_is_one_failed_decode_unit():
     assert (rows[0]["start"], rows[0]["end"]) == (0.0, 29.98)
     assert "failed_decode" in rows[0]["flags"]
     assert len(rows[0]["alternative_sources"]) == 1
+
+
+def test_broken_alternative_does_not_poison_valid_primary_decode():
+    raw = {"segments": [{"start": 0, "end": 3, "text": "سلام وقت بخیر",
+                          "words": [{"start": 0, "end": 1, "word": "سلام ", "probability": .9},
+                                    {"start": 1, "end": 2, "word": "وقت ", "probability": .9},
+                                    {"start": 2, "end": 3, "word": "بخیر", "probability": .9}]}]}
+    broken = {"segments": [{"start": 0, "end": 3, "text": "۶" * 40,
+                              "compression_ratio": 3.0}]}
+    row = build_evidence(raw, broken, 4)["segments"][0]
+    assert row["consensus_text"] == "سلام وقت بخیر"
+    assert "repetition" not in row["flags"]
+    assert "alternative_failed_decode" in row["flags"]
+
+
+def test_adjacent_compressed_primary_loop_rows_collapse_to_one_failed_decode():
+    raw = {"segments": [
+        {"start": 1, "end": 2, "text": "شکر می‌کنم", "compression_ratio": 8.0},
+        {"start": 2, "end": 3, "text": "شکر می‌کنم", "compression_ratio": 8.0},
+        {"start": 3, "end": 4, "text": "شکر می‌کنم", "compression_ratio": 8.0},
+    ]}
+    rows = build_evidence(raw, {"segments": []}, 5)["segments"]
+    assert len(rows) == 1
+    assert (rows[0]["start"], rows[0]["end"], rows[0]["text"]) == (1, 4, "[نامفهوم]")
+    assert "failed_decode" in rows[0]["flags"]
 
 
 @pytest.mark.parametrize("rows", [
@@ -44,6 +71,17 @@ def test_consensus_preserves_agreed_context_and_quarantines_number():
     assert result["reason"] == "sensitive_disagreement"
     agreed = consensus_for_row({"text": "سلام وقت بخیر", "alternative": "سلام وقت بخیر"})
     assert agreed["confidence_tier"] == "high"
+
+
+def test_strong_primary_word_alignment_can_resolve_ordinary_model_disagreement():
+    result = consensus_for_row({
+        "text": "کارشناس مربوطه با شما تماس می‌گیرد",
+        "alternative": "کارشان مربوطه با اتون تماس می‌گیره",
+        "words": [{"word": word, "probability": .82}
+                  for word in ("کارشناس", "مربوطه", "با", "شما", "تماس", "می‌گیرد")],
+    })
+    assert result["consensus_text"] == "کارشناس مربوطه با شما تماس می‌گیرد"
+    assert result["reason"] == "strong_primary_alignment_over_disagreement"
 
 
 def test_formats_are_case_insensitive_and_stem_collisions_fail_closed(tmp_path):
@@ -73,6 +111,92 @@ def test_v2_config_migration_is_idempotent_and_new_keys_win(tmp_path):
     assert config_path.read_text() == migrated
     assert AppConfig.for_root(tmp_path).asr_primary == "mlx-whisper:large-v3-turbo"
     assert "[extra]" in migrated
+
+
+def test_structured_glossary_parses_aliases_and_sensitive_names(tmp_path):
+    workspace = tmp_path / ".callforge"; workspace.mkdir()
+    (workspace / "config.toml").write_text('''
+[callforge]
+glossary = ["قدیمی"]
+
+[[callforge.terms]]
+canonical = "ونسی"
+type = "brand"
+aliases = ["وینسی", "اینسی"]
+
+[[callforge.terms]]
+canonical = "فاضلی"
+type = "support_name"
+aliases = ["آجلی", "آزلیه"]
+contexts = ["هستم"]
+min_alignment_score = 0.5
+min_alignment_margin = 0.1
+min_character_hits = 0.7
+''', encoding="utf-8")
+    config = AppConfig.for_root(tmp_path)
+    assert config.terms[0].canonical == "ونسی"
+    assert config.terms[0].aliases == ("وینسی", "اینسی")
+    assert config.terms[1].requires_acoustic_validation
+    assert config.terms[1].min_alignment_score == .5
+    assert config.terms[1].min_character_hits == .7
+
+
+def test_brand_alias_normalization_preserves_word_timing_and_does_not_insert_names():
+    brand = GlossaryTerm("ونسی", "brand", ("وینسی", "اینسی"))
+    bank = GlossaryTerm("بلوبانک", "brand", ("بلو بانک", "بولو بانک"))
+    person = GlossaryTerm("فاضلی", "support_name", ("آجلی",), ("هستم",))
+    result = {"segments": [{"text": "آجلی هستم از وینسی و بلو بانک",
+                             "words": [
+                                 {"word": "آجلی", "start": 0, "end": .4, "probability": .7},
+                                 {"word": " هستم", "start": .4, "end": .8, "probability": .8},
+                                 {"word": " از", "start": .8, "end": 1, "probability": .9},
+                                 {"word": " وینسی", "start": 1, "end": 1.4, "probability": .6},
+                                 {"word": " و", "start": 1.4, "end": 1.5, "probability": .9},
+                                 {"word": " بلو", "start": 1.5, "end": 1.8, "probability": .8},
+                                 {"word": " بانک", "start": 1.8, "end": 2.1, "probability": .7},
+                             ]}]}
+    assert normalize_result(result, (brand, bank, person)) == 2
+    segment = result["segments"][0]
+    assert segment["text"] == "آجلی هستم از ونسی و بلوبانک"
+    assert len(segment["words"]) == 6
+    assert segment["words"][-1]["start"] == 1.5 and segment["words"][-1]["end"] == 2.1
+
+
+def test_support_name_requires_ctc_score_and_runner_up_margin():
+    fazeli = GlossaryTerm("فاضلی", "support_name", ("آجلی", "آزلیه"), ("هستم",), .45, .08)
+    mohammadi = GlossaryTerm("محمدی", "support_name", ("ممدی",), ("هستم",), .45, .08)
+    evidence = {"segments": [{"id": "s1", "start": 4, "end": 8,
+                               "text": "[نامفهوم]", "alternative": "آزلیه هستم از وینسی",
+                               "flags": [], "words": [],
+                               "alternative_sources": [{"text": " آزلیه", "start": 4.8, "end": 5.3}],
+                               "retry": {}}]}
+    requests, groups = alignment_requests(evidence, (fazeli, mohammadi))
+    assert [row["text"] for row in requests] == ["فاضلی", "محمدی"]
+    alignment = {"segments": [
+        {"id": requests[0]["id"], "words": [{"accepted": True, "score": .72, "character_hits": .8}]},
+        {"id": requests[1]["id"], "words": [{"accepted": True, "score": .51, "character_hits": .7}]},
+    ]}
+    decisions = apply_alignment(evidence, groups, alignment)
+    assert decisions[0]["accepted"]
+    assert evidence["segments"][0]["alternative"] == "فاضلی هستم از وینسی"
+    assert "lexicon_ctc_validated" in evidence["segments"][0]["flags"]
+
+    evidence = {"segments": [{"id": "s1", "start": 4, "end": 8,
+                               "text": "[نامفهوم]", "alternative": "آزلیه هستم",
+                               "flags": [], "words": [],
+                               "alternative_sources": [{"text": "آزلیه", "start": 4.8, "end": 5.3}]}]}
+    requests, groups = alignment_requests(evidence, (fazeli, mohammadi))
+    close = {"segments": [
+        {"id": requests[0]["id"], "words": [{"accepted": True, "score": .58, "character_hits": .8}]},
+        {"id": requests[1]["id"], "words": [{"accepted": True, "score": .55, "character_hits": .7}]},
+    ]}
+    assert not apply_alignment(evidence, groups, close)[0]["accepted"]
+    assert evidence["segments"][0]["alternative"] == "آزلیه هستم"
+    row = evidence["segments"][0]
+    row["consensus_text"] = "آزلیه هستم"
+    guard_unverified_entities(row)
+    assert row["consensus_text"] == "[نامفهوم] هستم"
+    assert row["confidence_tier"] == "unresolved"
 
 
 def test_exact_40_reference_split_is_30_10():

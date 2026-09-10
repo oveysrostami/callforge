@@ -46,6 +46,66 @@ def test_human_review_is_versioned_synced_and_optimistically_locked(tmp_path):
     assert len(database.review_detail(audio_id)["versions"]) == 2
 
 
+def test_unclear_queue_correction_versions_transcript_and_saves_training_example(tmp_path):
+    database, audio, audio_id, initial, rows = prepared(tmp_path)
+    unclear = dict(
+        rows[0], text="سلام من [نامفهوم] هستم", raw_text="سلام من وینسی هستم",
+        alternative="سلام من ونسی هستم", flags=["unclear"], uncertain=True,
+        confidence_tier="unresolved", uncertainty_spans=[{"candidates": ["ونسی"]}],
+    )
+    replacement = render_markdown(audio.name, [unclear])
+    audio.with_suffix(".md").write_text(replacement, encoding="utf-8")
+    with database.transaction() as connection:
+        connection.execute("UPDATE transcripts SET content=?, content_hash=?, unclear_count=1 WHERE id=?",
+                           (replacement, __import__("hashlib").sha256(replacement.encode()).hexdigest(), initial))
+        connection.execute("UPDATE transcript_reviews SET data_json=? WHERE transcript_id=?",
+                           (json.dumps({"segments": [unclear]}, ensure_ascii=False), initial))
+
+    total, queue = database.review_queue()
+    assert total == 1
+    assert queue[0]["segment_id"] == "s1"
+    selected = next(item for item in queue[0]["candidates"] if item["text"] == "سلام من ونسی هستم")
+    result, correction = database.save_unclear_correction({
+        "audio_id": audio_id, "base_transcript_id": initial, "segment_id": "s1",
+        "reviewer": "بازبین", "selection_source": "candidate", "candidate_id": selected["id"],
+    })
+    assert result != initial
+    assert correction > 0
+    detail = database.review_detail(audio_id)
+    assert detail["status"] == "in_review"
+    assert detail["data"]["segments"][0]["text"] == "سلام من ونسی هستم"
+    assert detail["data"]["segments"][0]["confidence_tier"] == "human_corrected"
+    assert "ونسی" in audio.with_suffix(".md").read_text(encoding="utf-8")
+    assert database.review_queue()[0] == 0
+    saved = database.correction_examples()[0]
+    assert saved["source_transcript_id"] == initial
+    assert saved["result_transcript_id"] == result
+    assert saved["original_text"] == "سلام من [نامفهوم] هستم"
+    assert saved["corrected_text"] == "سلام من ونسی هستم"
+    assert json.loads(saved["evidence_json"])["raw_text"] == "سلام من وینسی هستم"
+
+
+def test_unclear_queue_custom_correction_rejects_stale_and_unresolved_text(tmp_path):
+    database, audio, audio_id, initial, rows = prepared(tmp_path)
+    unclear = dict(rows[0], text="[نامفهوم]", flags=["unclear"], uncertain=True)
+    content = render_markdown(audio.name, [unclear])
+    audio.with_suffix(".md").write_text(content, encoding="utf-8")
+    with database.transaction() as connection:
+        connection.execute("UPDATE transcripts SET content=?, content_hash=?, unclear_count=1 WHERE id=?",
+                           (content, __import__("hashlib").sha256(content.encode()).hexdigest(), initial))
+        connection.execute("UPDATE transcript_reviews SET data_json=? WHERE transcript_id=?",
+                           (json.dumps({"segments": [unclear]}, ensure_ascii=False), initial))
+    payload = {"audio_id": audio_id, "base_transcript_id": initial, "segment_id": "s1",
+               "reviewer": "بازبین", "selection_source": "custom", "custom_text": "[نامفهوم]"}
+    with pytest.raises(ValueError, match="کامل اصلاح"):
+        database.save_unclear_correction(payload)
+    assert database.correction_examples() == []
+    payload["custom_text"] = "پشتیبان ونسی هستم"
+    database.save_unclear_correction(payload)
+    with pytest.raises(ValueError, match="نسخه تغییر کرده"):
+        database.save_unclear_correction(payload)
+
+
 def test_nonfinite_metrics_are_normalized_in_transcript_and_run_evidence(tmp_path):
     database, audio, audio_id, _, rows = prepared(tmp_path)
     database.queue_transcription(audio_id)

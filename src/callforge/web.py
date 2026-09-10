@@ -27,6 +27,8 @@ TRANSCRIBE_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/transcribe$")
 PROGRESS_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/progress$")
 REVIEW_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/review$")
 SYNC_ROUTE = re.compile(r"^/api/files/(?P<id>\d+)/review/sync$")
+REVIEW_QUEUE_PATH = "/api/review"
+REVIEW_CORRECTIONS_PATH = "/api/review/corrections"
 STATIC_FILES = {
     "/": "index.html",
     "/index.html": "index.html",
@@ -63,9 +65,12 @@ def make_handler(
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
+            queue_correction = parsed.path == REVIEW_CORRECTIONS_PATH
             review_match = REVIEW_ROUTE.match(parsed.path)
             sync_match = SYNC_ROUTE.match(parsed.path)
             match = TRANSCRIBE_ROUTE.match(parsed.path) or review_match or sync_match
+            if queue_correction:
+                match = True
             if match is None:
                 self._error(HTTPStatus.NOT_FOUND, "مسیر پیدا نشد", True)
                 return
@@ -85,11 +90,24 @@ def make_handler(
             except ValueError:
                 self._error(HTTPStatus.BAD_REQUEST, "Content-Length نامعتبر است", True)
                 return
-            if length < 0 or length > (2_000_000 if review_match else 1024):
+            if length < 0 or length > (2_000_000 if review_match else 100_000 if queue_correction else 1024):
                 self.close_connection = True
                 self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "بدنهٔ درخواست بیش از حد بزرگ است", True)
                 return
             body = self.rfile.read(length) if length else b"{}"
+            if queue_correction:
+                try:
+                    payload = json.loads(body)
+                    if not isinstance(payload, dict):
+                        raise ValueError("Expected object")
+                    transcript_id, correction_id = database.save_unclear_correction(payload)
+                    self._json(
+                        {"transcript_id": transcript_id, "correction_id": correction_id},
+                        send_body=True,
+                    )
+                except (ValueError, KeyError, TypeError, OSError) as exc:
+                    self._error(HTTPStatus.CONFLICT, str(exc), True)
+                return
             audio_id = int(match.group("id"))
             if review_match or sync_match:
                 try:
@@ -125,6 +143,14 @@ def make_handler(
                     return
                 if parsed.path == "/api/files":
                     self._files(parse_qs(parsed.query), send_body)
+                    return
+                if parsed.path == REVIEW_QUEUE_PATH:
+                    self._review_queue(parse_qs(parsed.query), send_body)
+                    return
+                if parsed.path == REVIEW_CORRECTIONS_PATH:
+                    values = parse_qs(parsed.query)
+                    limit = _integer(values, "limit", 100, 500) or 100
+                    self._json({"items": database.correction_examples(limit=limit)}, send_body=send_body)
                     return
                 review_match = REVIEW_ROUTE.match(parsed.path)
                 if review_match:
@@ -168,6 +194,15 @@ def make_handler(
                 transcript=transcript,
                 review=values.get("review", [""])[0],
             )
+            self._json(
+                {"items": items, "total": total, "limit": limit, "offset": offset},
+                send_body=send_body,
+            )
+
+        def _review_queue(self, values: dict[str, list[str]], send_body: bool) -> None:
+            limit = _integer(values, "limit", 30, 100) or 30
+            offset = _integer(values, "offset", 0, 10_000_000)
+            total, items = database.review_queue(limit=limit, offset=offset)
             self._json(
                 {"items": items, "total": total, "limit": limit, "offset": offset},
                 send_body=send_body,

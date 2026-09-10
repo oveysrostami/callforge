@@ -228,6 +228,8 @@ def main() -> int:
     parser.add_argument("--prompt", default="")
     parser.add_argument("--start", type=float, default=0.0)
     parser.add_argument("--end", type=float)
+    parser.add_argument("--windows-file", type=Path,
+                        help="JSON array of exact {start,end} speech windows; keeps one model process alive")
     parser.add_argument("--temperature", dest="temperatures", type=float, action="append",
                         help="Ordered fallback temperatures; repeat to override the default 0, 0.2")
     parser.add_argument("--seed", type=int, help="MLX sampling seed for controlled experiments")
@@ -235,14 +237,58 @@ def main() -> int:
     if args.temperatures and any(not math.isfinite(t) or not 0 <= t <= 1 for t in args.temperatures):
         parser.error("temperatures must be finite values between 0 and 1")
     audio = args.audio.expanduser().resolve()
-    samples = read_clip(audio, args.start, args.end)
     backend = choose_backend(args.backend)
     from faster_whisper.vad import get_speech_timestamps, VadOptions
-    speech = get_speech_timestamps(samples, vad_options=VadOptions(threshold=.35, min_silence_duration_ms=500, speech_pad_ms=400))
-    if backend == "mlx":
-        text, segments, model = mlx_transcribe(samples, args)
+
+    if args.windows_file:
+        try:
+            requested_windows = json.loads(args.windows_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot read windows file: {exc}")
+        if not isinstance(requested_windows, list) or not requested_windows:
+            parser.error("windows file must contain a non-empty JSON array")
     else:
-        text, segments, model = faster_transcribe(samples, args)
+        requested_windows = [{"start": args.start, "end": args.end}]
+
+    all_segments = []
+    all_speech = []
+    texts = []
+    decoded_windows = []
+    model = None
+    for index, window in enumerate(requested_windows):
+        try:
+            start = float(window["start"])
+            end = None if window.get("end") is None else float(window["end"])
+        except (KeyError, TypeError, ValueError):
+            parser.error(f"invalid window at index {index}")
+        if not math.isfinite(start) or start < 0 or (end is not None and
+                (not math.isfinite(end) or end <= start)):
+            parser.error(f"invalid window bounds at index {index}")
+        args.start, args.end = start, end
+        samples = read_clip(audio, start, end)
+        actual_end = start + len(samples) / 16_000
+        speech = get_speech_timestamps(
+            samples,
+            vad_options=VadOptions(threshold=.35, min_silence_duration_ms=500,
+                                   speech_pad_ms=400),
+        )
+        if backend == "mlx":
+            text, segments, model = mlx_transcribe(samples, args)
+        else:
+            text, segments, model = faster_transcribe(samples, args)
+        texts.append(text)
+        all_segments.extend(segments)
+        all_speech.extend({"start": round(start + region["start"] / 16000, 3),
+                           "end": round(start + region["end"] / 16000, 3)}
+                          for region in speech)
+        decoded_windows.append({"start": round(start, 3), "end": round(actual_end, 3),
+                                "segment_count": len(segments)})
+
+    all_segments.sort(key=lambda row: (row.get("start", 0), row.get("end", 0)))
+    all_speech.sort(key=lambda row: (row["start"], row["end"]))
+    text = " ".join(value for value in texts if value).strip()
+    output_start = decoded_windows[0]["start"]
+    output_end = decoded_windows[-1]["end"]
     output = {
         "schema_version": 1,
         "audio": str(audio),
@@ -251,20 +297,22 @@ def main() -> int:
         "model": model,
         "resolved_model_path": getattr(args, "resolved_model_path", None),
         "language": args.language,
-        "start": args.start,
-        "end": args.start + len(samples) / 16_000,
+        "start": output_start,
+        "end": output_end,
         "text": text,
-        "segments": segments,
-        "speech_regions": [{"start": round(args.start + region["start"] / 16000, 3),
-                            "end": round(args.start + region["end"] / 16000, 3)} for region in speech],
+        "segments": all_segments,
+        "speech_regions": all_speech,
         "settings": {"temperature": args.temperatures or [0, .2], "seed": args.seed, "word_timestamps": True,
-                     "condition_on_previous_text": False, "vad_mode": "coverage_only",
+                     "condition_on_previous_text": False,
+                     "vad_mode": "tight_windows" if args.windows_file else "coverage_only",
                      "decoder_numerics_guard": backend == "mlx",
                      "vad_threshold": .35, "prompt": args.prompt},
         "provenance": {"provider": f"{backend}-whisper" if backend != "faster" else "faster-whisper",
-                       "model": model, "backend": backend, "offline": True},
-        "metrics": {"segment_count": len(segments),
-                    "word_count": sum(len(row.get("words", [])) for row in segments)},
+                       "model": model, "backend": backend, "offline": True,
+                       "decode_windows": decoded_windows},
+        "metrics": {"segment_count": len(all_segments),
+                    "word_count": sum(len(row.get("words", [])) for row in all_segments),
+                    "window_count": len(decoded_windows)},
         "runtime_versions": {name: importlib.metadata.version(name) for name in
                              ("numpy", "faster-whisper", "onnxruntime") + (("mlx-whisper",) if backend == "mlx" else ())},
     }

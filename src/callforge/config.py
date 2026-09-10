@@ -11,6 +11,61 @@ WORKSPACE_NAME = ".callforge"
 
 
 @dataclass(frozen=True)
+class GlossaryTerm:
+    """A canonical domain spelling and its evidence-bearing ASR aliases."""
+
+    canonical: str
+    kind: str = "term"
+    aliases: tuple[str, ...] = ()
+    contexts: tuple[str, ...] = ()
+    min_alignment_score: float = 0.10
+    min_alignment_margin: float = 0.08
+    min_character_hits: float = 0.60
+
+    @property
+    def requires_acoustic_validation(self) -> bool:
+        return self.kind in {"person", "support_name"}
+
+
+def _parse_terms(value: object) -> tuple[GlossaryTerm, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError("terms must be an array of TOML tables")
+    result = []
+    allowed_kinds = {"term", "brand", "product", "organization", "person", "support_name"}
+    for item in value:
+        canonical = str(item.get("canonical", "")).strip()
+        kind = str(item.get("type", "term")).strip()
+        aliases = item.get("aliases", [])
+        contexts = item.get("contexts", [])
+        if not canonical or any(char.isdigit() for char in canonical):
+            raise ValueError("term canonical values must be non-empty and contain no digits")
+        if kind not in allowed_kinds:
+            raise ValueError(f"unsupported term type: {kind}")
+        if (not isinstance(aliases, list) or not all(isinstance(alias, str) and alias.strip() for alias in aliases)
+                or not isinstance(contexts, list) or not all(isinstance(context, str) and context.strip()
+                                                              for context in contexts)):
+            raise ValueError("term aliases and contexts must be arrays of non-empty strings")
+        if any(any(char.isdigit() for char in alias) for alias in aliases):
+            raise ValueError("term aliases must not contain digits")
+        score = float(item.get("min_alignment_score", 0.10))
+        margin = float(item.get("min_alignment_margin", 0.08))
+        character_hits = float(item.get("min_character_hits", 0.60))
+        if not 0 <= score <= 1 or not 0 <= margin <= 1 or not 0 <= character_hits <= 1:
+            raise ValueError("term alignment score, margin and character hits must be between zero and one")
+        result.append(GlossaryTerm(canonical=canonical, kind=kind,
+                                   aliases=tuple(dict.fromkeys(str(alias).strip() for alias in aliases)),
+                                   contexts=tuple(dict.fromkeys(str(context).strip() for context in contexts)),
+                                   min_alignment_score=score, min_alignment_margin=margin,
+                                   min_character_hits=character_hits))
+    canonicals = [term.canonical for term in result]
+    if len(canonicals) != len(set(canonicals)):
+        raise ValueError("term canonical values must be unique")
+    return tuple(result)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     root: Path
     workspace: Path
@@ -27,7 +82,7 @@ class AppConfig:
     codex_idle_timeout_seconds: int = 120
     codex_review_attempts: int = 2
     codex_artifact_grace_seconds: int = 10
-    codex_reasoning_effort: str = "low"
+    codex_reasoning_effort: str = "medium"
     codex_model: str = ""
     codex_ignore_user_config: bool = True
     codex_ignore_rules: bool = True
@@ -49,6 +104,7 @@ class AppConfig:
     recovery_context_seconds: int = 2
     asr_heavy_concurrency: int = 1
     glossary: tuple[str, ...] = ()
+    terms: tuple[GlossaryTerm, ...] = ()
     diarization: bool = False
     diarization_timeout_seconds: int = 180
     alignment_timeout_seconds: int = 180
@@ -88,7 +144,7 @@ class AppConfig:
             codex_artifact_grace_seconds=int(
                 values.get("codex_artifact_grace_seconds", 10)
             ),
-            codex_reasoning_effort=str(values.get("codex_reasoning_effort", "low")),
+            codex_reasoning_effort=str(values.get("codex_reasoning_effort", "medium")),
             codex_model=str(values.get("codex_model", "")).strip(),
             codex_ignore_user_config=bool(
                 values.get("codex_ignore_user_config", True)
@@ -112,6 +168,7 @@ class AppConfig:
             recovery_context_seconds=int(values.get("recovery_context_seconds", 2)),
             asr_heavy_concurrency=int(values.get("asr_heavy_concurrency", 1)),
             glossary=tuple(str(item) for item in values.get("glossary", [])),
+            terms=_parse_terms(values.get("terms", [])),
             diarization=bool(values.get("diarization", True)),
             diarization_timeout_seconds=int(values.get("diarization_timeout_seconds", 180)),
             alignment_timeout_seconds=int(values.get("alignment_timeout_seconds", 180)),
@@ -172,7 +229,7 @@ class AppConfig:
                 "codex_idle_timeout_seconds = 120\n"
                 "codex_review_attempts = 2\n"
                 "codex_artifact_grace_seconds = 10\n"
-                'codex_reasoning_effort = "low"\n'
+                'codex_reasoning_effort = "medium"\n'
                 'codex_model = ""\n'
                 "codex_ignore_user_config = true\n"
                 "codex_ignore_rules = true\n"
@@ -247,4 +304,10 @@ class AppConfig:
         environment["CALLFORGE_MANAGED_TRANSCRIPTION"] = "1"
         environment["HF_HUB_OFFLINE"] = "1"
         environment["TRANSFORMERS_OFFLINE"] = "1"
+        # ONNX Runtime 1.29 enables POSIX telemetry on macOS. Its telemetry
+        # teardown can race a background callback and abort an otherwise
+        # successful ASR worker with ``recursive_mutex lock failed``. Disable
+        # it before faster-whisper imports ONNX Runtime; ASR itself is local
+        # and does not require telemetry.
+        environment["ORT_DISABLE_TELEMETRY"] = "1"
         return environment

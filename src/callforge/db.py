@@ -15,6 +15,7 @@ from typing import Iterator
 from callforge.metadata import AudioMetadata
 from callforge.json_utils import dumps as json_dumps
 from callforge.quality import file_hash, render_markdown, text_flags
+from callforge.review_queue import candidate_options, is_unresolved_segment, public_evidence
 
 
 MIN_PROCESSABLE_DURATION_SECONDS = 0.5
@@ -134,6 +135,31 @@ CREATE TABLE IF NOT EXISTS run_evidence (
     payload_json TEXT NOT NULL
 );
 PRAGMA user_version = 5;
+"""
+
+REVIEW_CORRECTIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS review_corrections (
+    id INTEGER PRIMARY KEY,
+    audio_file_id INTEGER NOT NULL REFERENCES audio_files(id) ON DELETE CASCADE,
+    source_transcript_id INTEGER NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+    result_transcript_id INTEGER NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+    segment_id TEXT NOT NULL,
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL,
+    original_text TEXT NOT NULL,
+    corrected_text TEXT NOT NULL,
+    selection_source TEXT NOT NULL CHECK(selection_source IN ('candidate', 'custom')),
+    candidate_id TEXT,
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    reviewer TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_corrections_audio
+ON review_corrections(audio_file_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_corrections_corrected
+ON review_corrections(corrected_text);
+PRAGMA user_version = 6;
 """
 
 MIGRATION_1_TO_2 = """
@@ -261,11 +287,11 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > 5:
+            if version > 6:
                 raise RuntimeError(
                     f"Database schema {version} is newer than this CallForge supports"
                 )
-            if 0 < version < 5:
+            if 0 < version < 6:
                 backup_directory = self.path.parent / "backups"
                 backup_directory.mkdir(exist_ok=True)
                 descriptor, backup_path = tempfile.mkstemp(prefix=f"schema-{version}-", suffix=".sqlite3", dir=backup_directory)
@@ -287,6 +313,7 @@ class Database:
             if version == 3:
                 connection.executescript(MIGRATION_3_TO_4)
             connection.executescript(QUALITY_SCHEMA)
+            connection.executescript(REVIEW_CORRECTIONS_SCHEMA)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -878,6 +905,183 @@ class Database:
                 "markdown_synced": bool(current["markdown_synced"]) if current else False,
                 "versions": [{key: row[key] for key in ("id", "version", "source", "content", "created_at", "status", "reviewer", "notes")} for row in rows],
             }
+
+    def review_queue(self, *, limit: int = 30, offset: int = 0) -> tuple[int, list[dict[str, object]]]:
+        """Return unresolved timed segments from current transcript versions."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT a.id AS audio_id, a.filename, a.relative_path, a.duration_seconds, "
+                "t.id AS transcript_id, t.version AS transcript_version, "
+                "COALESCE(r.status, 'needs_review') AS review_status, r.data_json "
+                "FROM transcripts t JOIN audio_files a ON a.id=t.audio_file_id "
+                "JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' "
+                "LEFT JOIN transcript_reviews r ON r.transcript_id=t.id "
+                "WHERE t.is_current=1 AND j.status NOT IN ('running', 'skipped') "
+                "AND COALESCE(r.status, 'needs_review') != 'approved' "
+                "ORDER BY (a.recorded_at IS NULL), a.recorded_at DESC, a.id DESC"
+            ).fetchall()
+
+        queue: list[dict[str, object]] = []
+        for record in rows:
+            try:
+                data = json.loads(record["data_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            segments = data.get("segments") or []
+            for index, segment in enumerate(segments):
+                if not isinstance(segment, dict) or not is_unresolved_segment(segment):
+                    continue
+                try:
+                    start, end = float(segment["start"]), float(segment["end"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                identifier = str(segment.get("id", f"segment-{index}"))
+                before = segments[index - 1].get("text", "") if index else ""
+                after = segments[index + 1].get("text", "") if index + 1 < len(segments) else ""
+                queue.append({
+                    "key": f"{record['audio_id']}:{record['transcript_id']}:{identifier}",
+                    "audio_id": record["audio_id"],
+                    "filename": record["filename"],
+                    "relative_path": record["relative_path"],
+                    "duration_seconds": record["duration_seconds"],
+                    "audio_url": f"/api/files/{record['audio_id']}/audio",
+                    "transcript_id": record["transcript_id"],
+                    "transcript_version": record["transcript_version"],
+                    "review_status": record["review_status"],
+                    "segment_id": identifier,
+                    "start": start,
+                    "end": end,
+                    "speaker": segment.get("speaker") or "گوینده نامشخص",
+                    "text": str(segment.get("text") or ""),
+                    "context_before": str(before or ""),
+                    "context_after": str(after or ""),
+                    "reason": segment.get("reason") or "unclear",
+                    "notes": segment.get("notes") or "",
+                    "candidates": candidate_options(segment),
+                })
+        return len(queue), queue[offset:offset + limit]
+
+    def correction_examples(self, *, limit: int = 100) -> list[dict[str, object]]:
+        """Expose persisted human corrections for later glossary extraction tooling."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT c.*, a.filename FROM review_corrections c "
+                "JOIN audio_files a ON a.id=c.audio_file_id "
+                "ORDER BY c.id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_unclear_correction(self, payload: dict) -> tuple[int, int]:
+        """Atomically version the transcript and save a glossary-mining example."""
+        try:
+            audio_id = int(payload["audio_id"])
+            base_transcript_id = int(payload["base_transcript_id"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("شناسهٔ تماس یا نسخه نامعتبر است") from None
+        segment_id = payload.get("segment_id")
+        reviewer = payload.get("reviewer", "")
+        selection_source = payload.get("selection_source")
+        if not isinstance(segment_id, str) or not segment_id or len(segment_id) > 500:
+            raise ValueError("شناسهٔ بخش نامعتبر است")
+        if not isinstance(reviewer, str) or not reviewer.strip() or len(reviewer) > 200:
+            raise ValueError("نام بازبین را وارد کنید")
+        if selection_source not in {"candidate", "custom"}:
+            raise ValueError("یک پیشنهاد مدل یا متن دستی را انتخاب کنید")
+
+        with self.transaction() as connection:
+            audio = connection.execute(
+                "SELECT a.*, j.status AS job_status FROM audio_files a "
+                "LEFT JOIN jobs j ON j.audio_file_id=a.id AND j.stage='transcribe' WHERE a.id=?",
+                (audio_id,),
+            ).fetchone()
+            if audio is None:
+                raise ValueError("Audio not found")
+            if audio["job_status"] in {"running", "skipped"}:
+                raise ValueError("بازبینی فایل در حال پردازش یا مدت صفر مجاز نیست")
+            current = connection.execute(
+                "SELECT * FROM transcripts WHERE audio_file_id=? AND is_current=1", (audio_id,)
+            ).fetchone()
+            if current is None or current["id"] != base_transcript_id:
+                raise ValueError("نسخه تغییر کرده است؛ صف بازبینی را تازه‌سازی کنید")
+            if file_hash(Path(audio["absolute_path"])) != current["audio_content_hash"]:
+                raise ValueError("فایل صوتی تغییر کرده است؛ ابتدا دوباره scan کنید")
+            review = connection.execute(
+                "SELECT data_json FROM transcript_reviews WHERE transcript_id=?", (current["id"],)
+            ).fetchone()
+            data = json.loads(review["data_json"] or "{}") if review else {}
+            segments = data.get("segments")
+            if not isinstance(segments, list):
+                raise ValueError("این transcript بخش زمان‌بندی‌شده برای بازبینی ندارد")
+            matches = [row for row in segments if isinstance(row, dict) and str(row.get("id")) == segment_id]
+            if len(matches) != 1:
+                raise ValueError("بخش بازبینی در نسخهٔ جاری پیدا نشد")
+            original = matches[0]
+            if not is_unresolved_segment(original):
+                raise ValueError("این بخش دیگر نامفهوم نیست؛ صف را تازه‌سازی کنید")
+            candidates = candidate_options(original)
+            evidence_snapshot = public_evidence(original)
+            candidate_id: str | None = None
+            if selection_source == "candidate":
+                candidate_id = payload.get("candidate_id")
+                selected = next((item for item in candidates if item["id"] == candidate_id), None)
+                if selected is None:
+                    raise ValueError("پیشنهاد انتخاب‌شده دیگر معتبر نیست")
+                corrected_text = selected["text"]
+            else:
+                corrected_text = payload.get("custom_text")
+                if not isinstance(corrected_text, str):
+                    raise ValueError("متن اصلاح‌شده را وارد کنید")
+                corrected_text = " ".join(corrected_text.split()).strip()
+            if not corrected_text or len(corrected_text) > 20_000:
+                raise ValueError("متن اصلاح‌شده نمی‌تواند خالی باشد")
+            if "[نامفهوم]" in corrected_text:
+                raise ValueError("برای ثبت این مورد، بخش نامفهوم را کامل اصلاح کنید")
+            if corrected_text == str(original.get("text") or "").strip():
+                raise ValueError("متن اصلاح‌شده با متن فعلی تفاوتی ندارد")
+
+            now = utcnow()
+            original_text = str(original.get("text") or "")
+            preserved_flags = [flag for flag in original.get("flags") or [] if flag != "unclear"]
+            original.update({
+                "text": corrected_text,
+                "uncertain": False,
+                "flags": text_flags(corrected_text, dict(original, flags=preserved_flags)),
+                "confidence_tier": "human_corrected",
+                "reason": "human_review_correction",
+                "human_correction": {
+                    "reviewer": reviewer.strip(),
+                    "selection_source": selection_source,
+                    "candidate_id": candidate_id,
+                    "created_at": now,
+                },
+            })
+            data["segments"] = segments
+            data["quality_status"] = "in_review"
+            content = render_markdown(audio["filename"], segments)
+            transcript_id, _ = self._store_transcript(
+                connection, audio_id, None, content, Path(audio["absolute_path"]).with_suffix(".md"),
+                current["language"], "human_review", force_version=True,
+            )
+            connection.execute(
+                "INSERT INTO transcript_reviews "
+                "(transcript_id,status,reviewer,notes,data_json,base_transcript_id,created_at) "
+                "VALUES (?, 'in_review', ?, ?, ?, ?, ?)",
+                (transcript_id, reviewer.strip(), "اصلاح بخش نامفهوم از صف بازبینی",
+                 json_dumps(data, ensure_ascii=False), current["id"], now),
+            )
+            cursor = connection.execute(
+                "INSERT INTO review_corrections "
+                "(audio_file_id,source_transcript_id,result_transcript_id,segment_id,start_seconds,end_seconds,"
+                "original_text,corrected_text,selection_source,candidate_id,candidates_json,evidence_json,reviewer,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (audio_id, current["id"], transcript_id, segment_id, float(original["start"]),
+                 float(original["end"]), original_text, corrected_text, selection_source, candidate_id,
+                 json_dumps(candidates, ensure_ascii=False),
+                 json_dumps(evidence_snapshot, ensure_ascii=False), reviewer.strip(), now),
+            )
+            correction_id = int(cursor.lastrowid)
+        self.sync_review_markdown(audio_id, transcript_id)
+        return transcript_id, correction_id
 
     def save_review(self, audio_id: int, payload: dict) -> int:
         """Append a human revision with optimistic locking; publication is recoverable."""

@@ -9,14 +9,19 @@ from callforge.quality import (
     apply_speaker_evidence,
     attach_coverage_retry,
     build_evidence,
+    compact_review_input,
+    coverage_attempt_windows,
     coverage_retry_candidates,
     coverage_retry_windows,
     normalize,
     prompt_leakage,
     render_markdown,
     text_flags,
+    tight_vad_windows,
     timed_units,
+    validate_publish_quality,
     validate_review,
+    validate_timeline,
 )
 
 
@@ -141,6 +146,18 @@ def test_enhanced_only_point_word_uses_enclosing_interval():
     assert (rows[0]["start"], rows[0]["end"], rows[0]["alternative"]) == (1, 2, "بله")
 
 
+def test_unowned_enhanced_point_is_dropped_when_primary_timeline_exists():
+    raw = {"segments": [{"start": 1, "end": 2, "text": "سلام"}]}
+    enhanced = {"segments": [{"start": .5, "end": 1.5, "text": "در سلام", "words": [
+        {"start": .5, "end": .5, "word": "در"},
+        {"start": 1, "end": 1.5, "word": " سلام"},
+    ]}]}
+    rows = build_evidence(raw, enhanced, 3)["segments"]
+    assert [(row["start"], row["end"]) for row in rows] == [(1, 2)]
+    assert rows[0]["alternative"] == "سلام"
+    validate_timeline(rows, 3)
+
+
 def test_empty_zero_duration_decoder_segment_is_not_canonical_evidence():
     raw = {"segments": [{"start": 1, "end": 1, "text": "", "words": []}]}
     assert build_evidence(raw, {"segments": []}, 2)["segments"] == []
@@ -181,6 +198,64 @@ def test_coverage_recovery_groups_missing_speech_and_includes_failed_decoder_row
     assert [plan["segment_ids"] for plan in plans] == [["s1", "s2", "s3"], ["s4"]]
     assert all(plan["end"] - plan["start"] == 30 for plan in plans)
     assert all(0 <= plan["start"] < plan["end"] <= data["duration_seconds"] for plan in plans)
+
+
+def test_tight_vad_windows_never_expand_into_leading_silence_and_split_long_regions():
+    windows = tight_vad_windows(
+        [{"start": 1.328, "end": 10.32}, {"start": 10.6, "end": 12},
+         {"start": 20, "end": 51}],
+        60,
+        maximum_seconds=15,
+    )
+    assert windows[:2] == [{"start": 1.328, "end": 12.0},
+                           {"start": 20.0, "end": 35.0}]
+    assert windows[-1] == {"start": 50.0, "end": 51.0}
+    assert all(0 < row["end"] - row["start"] <= 15 for row in windows)
+
+
+def test_stronger_models_try_the_same_tight_gap_before_window_expansion():
+    plan = {"start": 0, "end": 12.2, "gap_start": 1.7, "gap_end": 9.9}
+    attempts = coverage_attempt_windows(plan, 100, 30)
+    assert attempts[0] == {"start": 1.3, "end": 10.3, "mode": "tight_vad"}
+    assert attempts[1]["mode"] == "contextual"
+    assert attempts[-1]["mode"] == "expanded"
+
+
+def test_publish_gate_rejects_mostly_unresolved_or_looping_output():
+    clean = [{"id": f"s{i}", "text": "متن معتبر"} for i in range(7)]
+    clean += [{"id": f"u{i}", "text": "[نامفهوم]"} for i in range(3)]
+    validate_publish_quality(clean)
+    validate_publish_quality([
+        {"id": f"p{i}", "text": "عبارت درست [نامفهوم] با ادامهٔ معتبر"}
+        for i in range(10)
+    ])
+    with pytest.raises(ValueError, match="too unresolved"):
+        validate_publish_quality(clean + [{"id": "u4", "text": "[نامفهوم]"}])
+    with pytest.raises(ValueError, match="repetition"):
+        validate_publish_quality([{"id": "s1", "text": "نه نه نه نه نه"}])
+
+
+def test_markdown_coalesces_known_speaker_turns_but_not_unknown_speakers():
+    rows = [
+        {"start": .2, "end": 2.2, "text": "سلام،", "speaker": "پشتیبان", "uncertain": False},
+        {"start": 2.3, "end": 4.1, "text": "بفرمایید.", "speaker": "پشتیبان", "uncertain": False},
+        {"start": 4.2, "end": 4.6, "text": "ممنون.", "speaker": "گوینده نامشخص", "uncertain": False},
+        {"start": 4.6, "end": 5.1, "text": "خواهش می‌کنم.", "speaker": "گوینده نامشخص", "uncertain": False},
+    ]
+    markdown = render_markdown("test.mp3", rows)
+    assert "`00:00–00:05` سلام، بفرمایید." in markdown
+    assert markdown.count("**پشتیبان:**") == 1
+    assert markdown.count("**گوینده نامشخص:**") == 2
+    assert "00:04–00:04" not in markdown
+
+
+def test_compact_review_input_keeps_the_pipeline_consensus():
+    data = {"duration_seconds": 2, "segments": [{
+        "id": "s1", "start": 0, "end": 2, "text": "خام",
+        "alternative": "جایگزین", "flags": [], "speaker": "گوینده نامشخص",
+        "consensus_text": "متن مورد توافق", "confidence_tier": "high",
+    }]}
+    assert compact_review_input(data)["segments"][0]["consensus_text"] == "متن مورد توافق"
 
 
 def test_contextual_retry_is_partitioned_by_word_time_and_rejects_loops():

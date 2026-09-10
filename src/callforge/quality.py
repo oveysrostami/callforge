@@ -154,6 +154,80 @@ def coverage_retry_windows(
     return plans
 
 
+def tight_vad_windows(
+    speech_regions: list[dict] | None,
+    duration: float,
+    *,
+    maximum_seconds: float = 15.0,
+    merge_silence_seconds: float = 0.5,
+) -> list[dict]:
+    """Return short, non-overlapping speech windows without adding broad silence.
+
+    Whole-call decoding is useful as a cheap first hypothesis, but telephone
+    silence can poison the decoder before quiet Persian speech.  These windows
+    retain the detector's own small padding and never expand to a minimum size.
+    Long continuous regions are split only to keep Whisper below its 30-second
+    context limit.
+    """
+    if not math.isfinite(duration) or duration <= 0 or maximum_seconds <= 0:
+        return []
+    normalized = []
+    for region in speech_regions or []:
+        try:
+            start = max(0.0, float(region["start"]))
+            end = min(duration, float(region["end"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(start + end) or end - start < .2:
+            continue
+        if (normalized and start - normalized[-1]["end"] <= merge_silence_seconds
+                and end - normalized[-1]["start"] <= maximum_seconds):
+            normalized[-1]["end"] = end
+        else:
+            normalized.append({"start": start, "end": end})
+
+    windows = []
+    for region in normalized:
+        start = region["start"]
+        while region["end"] - start > maximum_seconds:
+            windows.append({"start": round(start, 3),
+                            "end": round(start + maximum_seconds, 3)})
+            start += maximum_seconds
+        if region["end"] - start >= .2:
+            windows.append({"start": round(start, 3), "end": round(region["end"], 3)})
+    return windows
+
+
+def coverage_attempt_windows(plan: dict, duration: float, expand_seconds: float) -> list[dict]:
+    """Try the exact speech gap before contextual and finally expanded audio.
+
+    Model fallback and window expansion are intentionally independent.  A
+    stronger model must first hear the same tight acoustic evidence that the
+    primary model failed on.
+    """
+    tight = {
+        "start": max(0.0, float(plan["gap_start"]) - .4),
+        "end": min(duration, float(plan["gap_end"]) + .4),
+        "mode": "tight_vad",
+    }
+    contextual = {"start": float(plan["start"]), "end": float(plan["end"]),
+                  "mode": "contextual"}
+    center = (float(plan["gap_start"]) + float(plan["gap_end"])) / 2
+    width = min(duration, float(expand_seconds))
+    expanded_start = max(0.0, min(duration - width, center - width / 2))
+    expanded = {"start": expanded_start, "end": expanded_start + width,
+                "mode": "expanded"}
+    result = []
+    seen = set()
+    for window in (tight, contextual, expanded):
+        key = (round(window["start"], 3), round(window["end"], 3))
+        if window["end"] <= window["start"] or key in seen:
+            continue
+        seen.add(key)
+        result.append(dict(window, start=key[0], end=key[1]))
+    return result
+
+
 def aligned_retry_for_gap(retry: dict, start: float, end: float) -> dict | None:
     """Keep only finite, non-looping retry words that land inside one VAD gap."""
     selected_segments = []
@@ -241,7 +315,9 @@ def compact_review_input(evidence: dict) -> dict:
     return {"duration_seconds": evidence["duration_seconds"], "segments": [
         {**{key: row.get(key) for key in (
             "id", "start", "end", "text", "alternative", "flags", "speaker",
-            "confidence_tier", "uncertainty_spans", "candidate_sources", "reason",
+            "consensus_text", "confidence_tier", "uncertainty_spans",
+            "candidate_sources", "reason",
+            "entity_resolutions", "entity_candidates",
         )},
          "retry_text": usable_retry_text(row)}
         for row in evidence["segments"]]}
@@ -314,6 +390,9 @@ def consensus_for_row(row: dict) -> dict:
     candidates = []
     for source, value in (("primary", row.get("text")), ("enhanced", row.get("alternative")),
                           ("recovery", usable_retry_text(row))):
+        if source == "enhanced" and set(row.get("flags", [])) & {
+                "alternative_failed_decode", "alternative_prompt_leakage"}:
+            continue
         text = normalize(str(value or ""))
         if text and text != "[نامفهوم]" and not set(text_flags(text)) & {"repetition", "compression"}:
             candidates.append({"source": source, "text": text})
@@ -354,6 +433,21 @@ def consensus_for_row(row: dict) -> dict:
         return {"consensus_text": candidates[0]["text"], "confidence_tier": "medium" if strong else "low",
                 "uncertainty_spans": [], "candidate_sources": [candidates[0]["source"]],
                 "reason": "strong_acoustic_alignment" if strong else "single_valid_hypothesis"}
+    primary = next((candidate for candidate in candidates if candidate["source"] == "primary"), None)
+    primary_probabilities = [float(word["probability"]) for word in row.get("words", [])
+                             if isinstance(word.get("probability"), (int, float))
+                             and math.isfinite(float(word["probability"]))]
+    primary_strong = (len(primary_probabilities) >= 2
+                      and sum(primary_probabilities) / len(primary_probabilities) >= .7)
+    disagreement_text = " ".join(candidate["text"] for candidate in candidates)
+    sensitive = bool(re.search(
+        r"\d|تومان|ریال|درصد|شماره|کد|تاریخ|نام خانوادگی|اسم(?:م| من)?",
+        disagreement_text,
+    ))
+    if primary and primary_strong and not sensitive:
+        return {"consensus_text": primary["text"], "confidence_tier": "medium",
+                "uncertainty_spans": [], "candidate_sources": ["primary"],
+                "reason": "strong_primary_alignment_over_disagreement"}
     left, right = candidates[0]["text"].split(), candidates[1]["text"].split()
     prefix = 0
     while prefix < min(len(left), len(right)) and left[prefix] == right[prefix]:
@@ -363,7 +457,8 @@ def consensus_for_row(row: dict) -> dict:
         suffix += 1
     left_middle = left[prefix:len(left) - suffix if suffix else len(left)]
     right_middle = right[prefix:len(right) - suffix if suffix else len(right)]
-    sensitive = bool(re.search(r"\d|تومان|ریال|درصد|شماره|کد|تاریخ", " ".join(left_middle + right_middle)))
+    sensitive = bool(re.search(r"\d|تومان|ریال|درصد|شماره|کد|تاریخ|نام خانوادگی|اسم(?:م| من)?",
+                               " ".join(left_middle + right_middle)))
     output = left[:prefix] + ["[نامفهوم]"] + (left[len(left) - suffix:] if suffix else [])
     reason = "sensitive_disagreement" if sensitive else "hypothesis_disagreement"
     return {"consensus_text": " ".join(output), "confidence_tier": "unresolved",
@@ -419,8 +514,17 @@ def build_evidence(raw: dict, enhanced: dict, duration: float, speech: list[dict
             end = item.get("end") if isinstance(item.get("end"), (int, float)) else start + .001
             start = min(max(0.0, float(start)), max(0.0, duration - .001))
             end = min(duration, max(start + .001, float(end)))
-            raw_units.append(dict(item, start=start, end=end, text="[نامفهوم]", words=[],
-                                  flags=segment_timing_flags(item, duration) + ["failed_decode"]))
+            failed = dict(item, start=start, end=end, text="[نامفهوم]", words=[],
+                          flags=segment_timing_flags(item, duration) + ["failed_decode"],
+                          failed_decode_texts=[str(item.get("text", "")).strip()])
+            if (raw_units and "failed_decode" in raw_units[-1].get("flags", [])
+                    and start <= float(raw_units[-1]["end"]) + .1):
+                previous = raw_units[-1]
+                previous["end"] = max(float(previous["end"]), end)
+                previous["flags"] = sorted(set(previous["flags"] + failed["flags"]))
+                previous.setdefault("failed_decode_texts", []).extend(failed["failed_decode_texts"])
+            else:
+                raw_units.append(failed)
         else:
             raw_units.extend(timed_units([item]))
     previous_end = 0.0
@@ -454,7 +558,12 @@ def build_evidence(raw: dict, enhanced: dict, duration: float, speech: list[dict
         flags = sorted(set(segment_timing_flags(item, duration) + ["failed_decode"]))
         if touched:
             for row in touched:
-                row["flags"] = sorted(set(row["flags"] + flags))
+                # A broken alternative is quarantined evidence; it must not
+                # downgrade or erase a valid primary decode of the same audio.
+                row["flags"] = sorted(set(row["flags"] + [
+                    "alternative_failed_decode",
+                    *(f"alternative_{flag}" for flag in flags if flag != "failed_decode"),
+                ]))
         elif end > start:
             rows.append({"id": "", "start": start, "end": end, "text": "[نامفهوم]",
                          "alternative": str(item.get("text", "")).strip(), "flags": flags,
@@ -514,10 +623,25 @@ def build_evidence(raw: dict, enhanced: dict, duration: float, speech: list[dict
                 if not (owner and owner.get("enhanced_only") and owner["end"] <= atom["start"]
                         and atom["start"] - owner["end"] <= .65 and atom["end"] - owner["start"] <= 8):
                     if atom["end"] == atom["start"]:
-                        # A lone point has no acoustic duration. Use its
-                        # enclosing decoder interval only when no adjacent
-                        # enhanced-only unit can own it.
-                        atom = dict(atom, start=item["start"], end=item["end"])
+                        if canonical:
+                            # A point token outside every valid primary
+                            # interval has no acoustic ownership. Dropping it
+                            # is safer than publishing a burst of millisecond
+                            # review units around otherwise valid speech.
+                            continue
+                        # A lone point has no acoustic duration. Bound the
+                        # decoder envelope to the uncovered canonical gap;
+                        # expanding across a valid primary row would create an
+                        # impossible overlapping timeline.
+                        point = float(atom["start"])
+                        left = max((row["end"] for row in canonical if row["end"] <= point),
+                                   default=float(item["start"]))
+                        right = min((row["start"] for row in canonical if row["start"] >= point),
+                                    default=float(item["end"]))
+                        atom = dict(atom, start=max(float(item["start"]), left),
+                                    end=min(float(item["end"]), right))
+                        if atom["end"] <= atom["start"]:
+                            continue
                     owner = {"start": atom["start"], "end": min(duration, atom["end"]),
                              "text": "[نامفهوم]", "alternative": "", "flags": ["speech_gap"],
                              "speaker": "گوینده نامشخص", "words": [], "alternative_sources": [],
@@ -704,9 +828,62 @@ def validate_review(value: dict, evidence: dict) -> list[dict]:
     return sorted(result, key=lambda row: (row["start"], row["end"]))
 
 
-def timestamp(value: float) -> str:
-    minutes, seconds = divmod(int(value), 60)
+def validate_publish_quality(rows: list[dict], *, maximum_unresolved_ratio: float = .35) -> None:
+    """Fail closed when an automated review is still mostly unresolved or looping.
+
+    A segment containing one unresolved span can still preserve a useful long
+    prefix and suffix.  Count only marker-only segments here; token-span detail
+    remains available in ``uncertainty_spans`` and the human review queue.
+    """
+    if not rows:
+        raise ValueError("No reviewed speech was produced")
+    looping = [row.get("id", "?") for row in rows
+               if "repetition" in text_flags(str(row.get("text", "")))]
+    if looping:
+        raise ValueError(f"Reviewed output still contains decoder repetition: {', '.join(looping)}")
+    unresolved = sum(normalize(str(row.get("text", ""))) == "[نامفهوم]" for row in rows)
+    ratio = unresolved / len(rows)
+    if ratio > maximum_unresolved_ratio:
+        raise ValueError(
+            f"Reviewed output is too unresolved to publish ({unresolved}/{len(rows)}, {ratio:.0%})"
+        )
+
+
+def timestamp(value: float, *, round_up: bool = False) -> str:
+    seconds_total = math.ceil(value) if round_up else math.floor(value)
+    minutes, seconds = divmod(max(0, seconds_total), 60)
     return f"{minutes:02}:{seconds:02}"
+
+
+def display_rows(segments: list[dict], *, maximum_seconds: float = 15.0,
+                 maximum_gap_seconds: float = .35) -> list[dict]:
+    """Coalesce adjacent turns for readable Markdown without changing evidence.
+
+    Review audio and quality JSON intentionally retain their precise, short
+    segments.  Only presentation rows from an acoustically identified speaker
+    are joined: merging unknown speakers could incorrectly combine two people.
+    """
+    rows: list[dict] = []
+    for source in segments:
+        row = dict(source)
+        speaker = str(row.get("speaker") or "گوینده نامشخص").strip()
+        row["speaker"] = speaker
+        previous = rows[-1] if rows else None
+        gap = float(row["start"]) - float(previous["end"]) if previous else math.inf
+        can_join = bool(
+            previous
+            and speaker == previous["speaker"]
+            and speaker != "گوینده نامشخص"
+            and 0 <= gap <= maximum_gap_seconds
+            and float(row["end"]) - float(previous["start"]) <= maximum_seconds
+        )
+        if not can_join:
+            rows.append(row)
+            continue
+        previous["end"] = row["end"]
+        previous["text"] = f'{str(previous.get("text", "")).rstrip()} {str(row.get("text", "")).lstrip()}'.strip()
+        previous["uncertain"] = bool(previous.get("uncertain") or row.get("uncertain"))
+    return rows
 
 
 def render_markdown(filename: str, segments: list[dict], *, human_reviewed: bool = False) -> str:
@@ -714,10 +891,10 @@ def render_markdown(filename: str, segments: list[dict], *, human_reviewed: bool
              "- بازبینی: " + ("تأیید انسانی" if human_reviewed else "نیازمند بازبینی انسانی"), "", "## مکالمه", ""]
     if not segments:
         lines.append("[گفتاری شناسایی نشد؛ نیازمند بررسی صوت]")
-    for row in segments:
+    for row in display_rows(segments):
         label = re.sub(r"[\r\n*]", "", row["speaker"])
         warning = " [نیازمند بازبینی]" if row.get("uncertain") and "[نامفهوم]" not in row["text"] else ""
-        lines.extend([f"**{label}:** `{timestamp(row['start'])}–{timestamp(row['end'])}` {row['text']}{warning}", ""])
+        lines.extend([f"**{label}:** `{timestamp(row['start'])}–{timestamp(row['end'], round_up=True)}` {row['text']}{warning}", ""])
     return "\n".join(lines).rstrip() + "\n"
 
 

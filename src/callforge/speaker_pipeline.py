@@ -11,6 +11,7 @@ from pathlib import Path
 from callforge.alignment import MODEL, REVISION
 from callforge.alignment_experiment import refine_segments
 from callforge.quality import write_json
+from callforge.runtime_locks import HEAVY_MODEL_LOCK
 from callforge.roles import align_segments, apply_roles, role_input, role_prompt, role_schema, validate_roles
 from callforge.speaker_runtime import environment, python
 
@@ -39,17 +40,18 @@ class SpeakerPipeline:
 
     def _json_process(self, command, destination, errors, timeout):
         from callforge.codex_runner import CodexRunner
-        with destination.open("w", encoding="utf-8") as out, errors.open("a", encoding="utf-8") as err:
-            process = subprocess.Popen(command, env=environment(self.config, offline=True),
-                                       stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-                                       text=True, **CodexRunner._process_options())
-            try:
-                code = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                raise RuntimeError(f"Local speaker stage exceeded {timeout} seconds") from None
-            finally:
-                if process.poll() is None:
-                    CodexRunner._terminate_process_tree(process)
+        with HEAVY_MODEL_LOCK:
+            with destination.open("w", encoding="utf-8") as out, errors.open("a", encoding="utf-8") as err:
+                process = subprocess.Popen(command, env=environment(self.config, offline=True),
+                                           stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                                           text=True, **CodexRunner._process_options())
+                try:
+                    code = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(f"Local speaker stage exceeded {timeout} seconds") from None
+                finally:
+                    if process.poll() is None:
+                        CodexRunner._terminate_process_tree(process)
         if code:
             raise RuntimeError("Local speaker model failed. Run `callforge setup --yes`; details are in the processing log.")
         return json.loads(destination.read_text(encoding="utf-8"))

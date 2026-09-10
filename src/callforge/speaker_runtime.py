@@ -46,6 +46,7 @@ def environment(config=None, *, offline: bool = False) -> dict[str, str]:
     env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
     env["PYANNOTE_METRICS_ENABLED"] = "0"
     env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    env["ORT_DISABLE_TELEMETRY"] = "1"
     env["DISABLE_SAFETENSORS_CONVERSION"] = "1"
     if offline:
         env["HF_HUB_OFFLINE"] = "1"

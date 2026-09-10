@@ -65,6 +65,7 @@ class HangingProcess:
 def test_runtime_environment_preserves_virtualenv_executable(tmp_path, monkeypatch):
     executable = tmp_path / "venv" / "bin" / "python"
     monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setenv("ORT_DISABLE_TELEMETRY", "0")
     config = AppConfig.for_root(tmp_path)
 
     environment = config.runtime_environment()
@@ -72,7 +73,8 @@ def test_runtime_environment_preserves_virtualenv_executable(tmp_path, monkeypat
     assert environment["CALLFORGE_PYTHON"] == str(executable)
     assert environment["HF_HOME"] == str(config.models.resolve())
     assert environment["CALLFORGE_MANAGED_TRANSCRIPTION"] == "1"
-    assert config.codex_reasoning_effort == "low"
+    assert environment["ORT_DISABLE_TELEMETRY"] == "1"
+    assert config.codex_reasoning_effort == "medium"
     assert config.codex_idle_timeout_seconds == 120
     assert config.codex_artifact_grace_seconds == 10
     assert config.codex_ignore_user_config is True
@@ -114,6 +116,7 @@ print(json.dumps({
     "hf_home": os.environ.get("HF_HOME"),
     "python": sys.executable,
     "prompt": sys.argv[sys.argv.index("--prompt") + 1],
+    "arguments": sys.argv[1:],
 }))
 """.strip()
         + "\n",
@@ -136,6 +139,7 @@ print(json.dumps({
     assert raw["hf_home"] == agc["hf_home"] == str(config.models.resolve())
     assert raw["python"] == agc["python"] == sys.executable
     assert raw["prompt"] == ""
+    assert raw["arguments"][raw["arguments"].index("--seed") + 1] == "0"
     events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert events[0]["stage"] == "prepare_audio"
     assert not any(event["stage"] == "model_download" for event in events)
@@ -184,14 +188,15 @@ else:
     LocalWhisperPipeline(config, skill).prepare(audio, work, log, stderr)
 
     result = json.loads((work / "evidence.json").read_text(encoding="utf-8"))
-    assert result["coverage_recovery"] == {
-        "requested_windows": 1, "completed_windows": 1,
-        "recovered_segments": 1, "remaining_segments": 0,
-        "audio_variant": "window_quality_selection",
-        "cascade": ["mlx-whisper:large-v3-turbo", "mlx-whisper:large-v3"],
-    }
+    assert result["coverage_recovery"]["requested_windows"] == 1
+    assert result["coverage_recovery"]["completed_windows"] == 1
+    assert result["coverage_recovery"]["recovered_segments"] == 1
+    assert result["coverage_recovery"]["remaining_segments"] == 0
+    assert result["coverage_recovery"]["cascade"] == [
+        "mlx-whisper:large-v3-turbo", "mlx-whisper:large-v3"]
+    assert result["coverage_recovery"]["attempts"][0]["window_mode"] == "tight_vad"
     assert result["segments"][0]["retry"]["text"] == "سلام دنیا"
-    assert (work / "coverage-1-0-raw.json").is_file()
+    assert (work / "coverage-1-0-0-raw.json").is_file()
     events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert any(event["stage"] == "whisper_coverage" and event["state"] == "completed"
                for event in events)

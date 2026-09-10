@@ -15,6 +15,7 @@ Transcribe the requested recording locally. In standalone mode save a same-name 
 - For `external-`, the first field is the support extension and the second is the remote number. For `out-`, the first field is the remote number and the second is the support extension. For `internal-`, the first and second fields are the two extensions.
 - Speaker identity and role are separate. Use `گوینده نامشخص` whenever the evidence does not establish a turn or role. Text-only review is not acoustic diarization. Filename direction alone cannot identify a speaker; use `کارشناس پشتیبانی`, `مشتری`, or extension labels only when supported.
 - A glossary is only a spelling hint. Do not insert missing entities, resolve an ambiguous amount/date/identifier from context, or copy numbers from filenames. Keep units and digits literal and mark uncertain wording. Two passes of the same model can share an error; agreement is not proof.
+- A structured glossary may provide an accepted `entity_resolutions` record for an exact person-name span. This means the observed alias passed local Persian CTC score, character-hit and runner-up checks. It is acoustic evidence only for that span. A rejected `entity_candidates` record is not evidence and must remain unresolved.
 - Do not summarize or omit greetings, repeated phrases, hesitations that affect meaning, amounts, identifiers, or closing remarks.
 
 ## Runtime
@@ -32,6 +33,7 @@ When the request supplies prepared JSON paths and a canonical evidence timeline,
 - do not write files, create extra artifacts, or claim to have listened to the source audio;
 - prefer high-tier consensus, preserve agreed prefix/suffix, and put `[نامفهوم]` only over the unresolved span;
 - accept ordinary words with two valid hypotheses or strong alignment. Require two model families or sufficient acoustic evidence for numbers, amounts, dates, names and identifiers;
+- use an accepted `entity_resolutions` canonical spelling only in its attached segment; never copy it into another introduction or infer a person from extension/history;
 - include every canonical segment id exactly once, retaining complete wording without summarization; put unresolved speech in `[نامفهوم]`, set `uncertain=true`, and explain the unresolved difference in `notes`;
 - enhanced alternatives are partitioned between review units; do not repeat one unit's alternative in its neighbors. `alternative_timing_uncertain` marks a joint unit with unavailable word timing, not automatically unintelligible speech;
 - do not alter timing or omit a segment because it is repetitive or difficult; describe confirmed non-speech explicitly and flag uncertain non-speech decisions;

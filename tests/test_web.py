@@ -84,6 +84,46 @@ def test_human_review_http_roundtrip_history_and_filter(tmp_path):
         server.shutdown(); server.server_close(); thread.join(timeout=3)
 
 
+def test_review_queue_http_updates_transcript_and_exposes_correction_corpus(tmp_path):
+    server, thread, audio_id = prepared_server(tmp_path)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    config = AppConfig.for_root(tmp_path)
+    database = Database(config.database)
+    try:
+        with database.transaction() as connection:
+            transcript_id = connection.execute(
+                "SELECT id FROM transcripts WHERE audio_file_id=? AND is_current=1", (audio_id,)
+            ).fetchone()[0]
+            row = {"id": "s1", "start": 1, "end": 3, "speaker": "کارشناس",
+                   "text": "من [نامفهوم] هستم", "raw_text": "من وینسی هستم",
+                   "alternative": "من ونسی هستم", "flags": ["unclear"], "uncertain": True}
+            connection.execute(
+                "INSERT INTO transcript_reviews (transcript_id,status,data_json,created_at) VALUES (?,?,?,?)",
+                (transcript_id, "needs_review", json.dumps({"segments": [row]}, ensure_ascii=False), "2026-09-10"),
+            )
+        _, queue = get_json(f"{base}/api/review")
+        assert queue["total"] == 1
+        item = queue["items"][0]
+        candidate = next(value for value in item["candidates"] if value["text"] == "من ونسی هستم")
+        payload = {"audio_id": audio_id, "base_transcript_id": transcript_id, "segment_id": "s1",
+                   "reviewer": "test", "selection_source": "candidate", "candidate_id": candidate["id"]}
+        request = Request(
+            f"{base}/api/review/corrections", method="POST", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "X-CallForge-UI": "1"},
+        )
+        with urlopen(request, timeout=3) as response:
+            saved = json.loads(response.read())
+        assert saved["transcript_id"] != transcript_id
+        _, queue = get_json(f"{base}/api/review")
+        assert queue["total"] == 0
+        _, corpus = get_json(f"{base}/api/review/corrections")
+        assert corpus["items"][0]["corrected_text"] == "من ونسی هستم"
+        _, detail = get_json(f"{base}/api/files/{audio_id}")
+        assert "ونسی" in detail["transcript_content"]
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=3)
+
+
 def test_ui_api_lists_details_and_streams_range(tmp_path: Path):
     server, thread, audio_id = prepared_server(tmp_path)
     base = f"http://127.0.0.1:{server.server_address[1]}"

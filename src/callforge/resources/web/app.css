@@ -48,6 +48,12 @@ button, select { cursor: pointer; }
 .connection { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .connection span { width: 8px; height: 8px; border-radius: 50%; background: #39a474; box-shadow: 0 0 0 5px rgba(57,164,116,.12); }
 .connection.offline span { background: var(--red); }
+.topbar-actions { display: flex; align-items: center; gap: 24px; }
+.main-nav { display: flex; align-items: center; gap: 5px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.78); }
+.main-nav button { border: 0; border-radius: 8px; padding: 7px 13px; background: transparent; color: var(--muted); font-size: 12px; }
+.main-nav button.active { background: var(--green); color: white; box-shadow: 0 4px 12px rgba(25,108,77,.18); }
+.main-nav button span { display: inline-flex; min-width: 21px; justify-content: center; margin-right: 5px; padding: 1px 6px; border-radius: 999px; background: rgba(25,108,77,.1); color: var(--green); font-size: 10px; }
+.main-nav button.active span { background: rgba(255,255,255,.18); color: white; }
 
 main { padding: 28px clamp(20px, 4vw, 64px) 50px; }
 .stats { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 14px; margin-bottom: 20px; }
@@ -189,6 +195,46 @@ audio { display: block; width: 100%; height: 42px; }
 #review-segments { max-height: 680px; overflow: auto; padding: 3px; }
 #review-message { font-size: 12px; color: #7a3b16; }
 
+.review-queue-view { max-width: 1100px; margin: 0 auto; }
+.review-queue-heading { display: flex; align-items: end; justify-content: space-between; gap: 28px; margin-bottom: 18px; }
+.review-queue-heading h2 { margin: 5px 0 7px; font-size: 24px; }
+.review-queue-heading p:last-child { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.9; }
+.review-queue-heading label { min-width: 240px; color: var(--muted); font-size: 11px; }
+.review-queue-heading input { display: block; width: 100%; margin-top: 5px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: white; color: var(--ink); }
+.queue-player-card { position: sticky; top: 8px; z-index: 5; display: grid; grid-template-columns: minmax(180px, .55fr) minmax(300px, 1.45fr); align-items: center; gap: 20px; padding: 13px 16px; border: 1px solid #bfd5c9; border-radius: 14px; background: rgba(255,255,255,.96); box-shadow: 0 10px 32px rgba(29,48,39,.1); backdrop-filter: blur(12px); }
+.queue-player-card strong, .queue-player-card span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-player-card strong { direction: ltr; text-align: right; font-size: 12px; }
+.queue-player-card span { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.queue-message { min-height: 20px; margin: 10px 4px; color: var(--green); font-size: 12px; }
+.review-queue-list { display: grid; gap: 14px; }
+.review-queue-view > .empty { position: static; min-height: 380px; }
+.queue-item { padding: 18px; border: 1px solid var(--line); border-radius: 15px; background: white; box-shadow: 0 6px 25px rgba(29,48,39,.045); }
+.queue-item > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 13px; border-bottom: 1px solid #edf0ed; }
+.queue-item > header > div { min-width: 0; }
+.queue-file-link { display: block; max-width: 650px; overflow: hidden; border: 0; padding: 0; background: transparent; color: var(--ink); direction: ltr; text-align: right; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+.queue-file-link:hover { color: var(--green); text-decoration: underline; text-underline-offset: 3px; }
+.queue-item > header span { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; }
+.queue-play, .queue-save { border: 0; border-radius: 9px; padding: 9px 13px; background: var(--green-soft); color: var(--green); font: inherit; font-size: 11px; font-weight: 700; }
+.queue-context { margin: 14px 0; padding: 10px 13px; border-right: 3px solid #8eb5a2; border-radius: 8px; background: #f6faf7; }
+.queue-context-line { margin: 3px 0; color: #56635c; font-size: 12px; line-height: 1.9; }
+.queue-context-line strong { color: var(--ink); }
+.queue-item fieldset { margin: 0; padding: 0; border: 0; }
+.queue-item legend { margin-bottom: 9px; color: var(--muted); font-size: 11px; }
+.queue-option { display: grid; grid-template-columns: 20px 1fr auto; align-items: center; gap: 8px; margin: 7px 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; cursor: pointer; transition: border .15s ease, background .15s ease; }
+.queue-option:hover, .queue-option:has(input:checked) { border-color: #76aa92; background: #f3f8f5; }
+.queue-option input { accent-color: var(--green); }
+.queue-option span { font-size: 12px; line-height: 1.8; }
+.queue-option small { color: var(--muted); font-size: 9px; white-space: nowrap; }
+.queue-custom-option { grid-template-columns: 20px 1fr; }
+.queue-custom-text { display: block; width: 100%; margin-top: 7px; padding: 10px 12px; resize: vertical; border: 1px solid #a3b4aa; border-radius: 9px; background: white; color: var(--ink); font: 12px/1.9 inherit; }
+.queue-item details { margin-top: 12px; color: var(--muted); font-size: 11px; line-height: 1.8; }
+.queue-item summary { cursor: pointer; }
+.queue-item > footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 14px; }
+.queue-item-message { color: var(--red); font-size: 11px; }
+.queue-save { min-width: 115px; background: var(--green); color: white; }
+.queue-save:disabled, .queue-play:disabled { opacity: .5; cursor: wait; }
+.review-queue-view > .empty { position: static; min-height: 340px; }
+
 @media (max-width: 1050px) {
   .workspace { grid-template-columns: 1fr; }
   .library-panel { border-left: 0; border-bottom: 1px solid var(--line); }
@@ -198,6 +244,8 @@ audio { display: block; width: 100%; height: 42px; }
 @media (max-width: 650px) {
   .topbar { height: 78px; }
   .connection { font-size: 0; }
+  .topbar-actions { gap: 8px; }
+  .main-nav button { padding: 7px 9px; }
   main { padding: 16px 12px 30px; }
   .stats { grid-template-columns: 1fr 1fr; gap: 8px; }
   .stats article { padding: 13px 15px; }
@@ -209,4 +257,11 @@ audio { display: block; width: 100%; height: 42px; }
   .detail-content { padding: 18px; }
   .detail-title { flex-direction: column; }
   .detail-actions { width: 100%; flex-direction: row; justify-content: space-between; align-items: center; }
+  .review-queue-heading { align-items: stretch; flex-direction: column; gap: 12px; }
+  .review-queue-heading label { min-width: 0; }
+  .queue-player-card { grid-template-columns: 1fr; gap: 8px; }
+  .queue-item > header { align-items: stretch; flex-direction: column; }
+  .queue-play { align-self: flex-start; }
+  .queue-option { grid-template-columns: 20px 1fr; }
+  .queue-option small { grid-column: 2; }
 }

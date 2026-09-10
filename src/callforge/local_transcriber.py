@@ -4,31 +4,33 @@ import json
 import subprocess
 import sys
 import time
-import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from callforge.config import AppConfig
+from callforge.config import AppConfig, GlossaryTerm
 from callforge import __version__
 from callforge.asr import choose_candidate, parse_spec, provider_command
+from callforge.lexicon import (alignment_requests, apply_alignment,
+                               guard_unverified_entities, normalize_result,
+                               term_snapshot)
 from callforge.quality import (
     attach_coverage_retry,
     build_evidence,
+    coverage_attempt_windows,
     coverage_retry_candidates,
     coverage_retry_windows,
     prompt_leakage,
     consensus_for_row,
-    normalize,
     retry_priority,
+    segment_is_quarantined,
+    tight_vad_windows,
     usable_retry_text,
     write_json,
 )
 from callforge.json_utils import finite_json
-
-
-_HEAVY_ASR_LOCK = threading.Semaphore(1)
+from callforge.runtime_locks import HEAVY_MODEL_LOCK
 
 
 @dataclass(frozen=True)
@@ -55,14 +57,15 @@ class LocalWhisperPipeline:
             "این یک مکالمه تلفنی فارسی میان مشتری و کارشناس پشتیبانی است."
             if self.config.language == "fa" else ""
         )
-        glossary = "، ".join(self.config.glossary)
+        glossary = "، ".join(dict.fromkeys(
+            (*self.config.glossary, *(term.canonical for term in self.config.terms))))
         if base and glossary:
             return f"{base} املای واژه‌های احتمالی: {glossary}"
         return base or glossary
 
     def _asr_command(self, audio: Path, spec_value: str, prompt: str = "",
                      start: float | None = None, end: float | None = None,
-                     seed: int | None = None) -> list[str]:
+                     seed: int | None = 0) -> list[str]:
         return provider_command(self.skill_directory, audio, parse_spec(spec_value),
                                 self.config.language, prompt, start, end, seed)
 
@@ -183,25 +186,60 @@ class LocalWhisperPipeline:
                 handle.write("\n")
 
     def _normalize_glossary_spelling(self, parsed: dict) -> None:
-        """Correct only an already-present orthographic equivalent.
+        """Normalize an observed non-sensitive alias without inventing a term."""
+        legacy = tuple(GlossaryTerm(canonical=term) for term in self.config.glossary
+                       if term.strip() and not any(char.isdigit() for char in term))
+        normalize_result(parsed, (*legacy, *self.config.terms))
 
-        This cannot insert absent glossary entities and deliberately ignores
-        multi-word terms and anything containing a digit.
-        """
-        terms = {normalize(term): term for term in self.config.glossary
-                 if term.strip() and not any(char.isdigit() for char in term) and len(term.split()) == 1}
-        if not terms:
-            return
-        changed = False
-        for segment in parsed.get("segments", []):
-            pieces = str(segment.get("text", "")).split()
-            corrected = [terms.get(normalize(piece), piece) for piece in pieces]
-            if corrected != pieces:
-                segment["text"] = " ".join(corrected)
-                changed = True
-        if changed:
-            parsed["text"] = " ".join(str(row.get("text", "")) for row in parsed.get("segments", [])).strip()
-            parsed.setdefault("provenance", {})["glossary_mode"] = "orthographic_equivalence_only"
+    def _validate_sensitive_terms(self, evidence: dict, audio: Path, directory: Path,
+                                  stderr_path: Path) -> dict:
+        """Confirm observed person-name aliases with the cached Persian CTC model."""
+        requests, groups = alignment_requests(evidence, self.config.terms)
+        summary = {"terms": term_snapshot(self.config.terms), "requested": len(groups),
+                   "accepted": 0, "status": "not_needed" if not groups else "pending"}
+        if not groups:
+            evidence["lexicon"] = summary
+            return summary
+        from callforge.speaker_runtime import environment, python
+        executable = python(self.config)
+        if not executable.is_file():
+            summary.update(status="unsupported", error="persian_ctc_runtime_missing")
+            evidence["lexicon"] = summary
+            return summary
+        request_path = directory / "lexicon-alignment-input.json"
+        result_path = directory / "lexicon-alignment.json"
+        write_json(request_path, {"segments": requests})
+        try:
+            with HEAVY_MODEL_LOCK:
+                completed = subprocess.run(
+                    [str(executable), "-m", "callforge.alignment_worker", "--audio", str(audio),
+                     "--input", str(request_path)],
+                    env=environment(self.config, offline=True), capture_output=True, text=True,
+                    timeout=self.config.alignment_timeout_seconds,
+                )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._append_stderr(stderr_path, "lexicon CTC", str(exc))
+            summary.update(status="unsupported", error=type(exc).__name__)
+            evidence["lexicon"] = summary
+            return summary
+        self._append_stderr(stderr_path, "lexicon CTC", completed.stderr)
+        if completed.returncode:
+            summary.update(status="unsupported",
+                           error=(completed.stderr.strip() or completed.stdout.strip())[-1000:])
+            evidence["lexicon"] = summary
+            return summary
+        try:
+            result = finite_json(json.loads(completed.stdout))
+        except (json.JSONDecodeError, TypeError) as exc:
+            summary.update(status="unsupported", error=f"invalid_alignment_result: {exc}")
+            evidence["lexicon"] = summary
+            return summary
+        write_json(result_path, result)
+        decisions = apply_alignment(evidence, groups, result)
+        summary.update(status="completed", accepted=sum(bool(row["accepted"]) for row in decisions),
+                       decisions=decisions)
+        evidence["lexicon"] = summary
+        return summary
 
     def _run_json(
         self,
@@ -215,8 +253,9 @@ class LocalWhisperPipeline:
         heavy = (any(value.endswith(("transcribe_audio.py", "qwen_worker.py")) for value in command)
                  or any(value in {"large-v3", "full", "Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B"}
                         for value in command))
-        guard = _HEAVY_ASR_LOCK if heavy else nullcontext()
+        guard = HEAVY_MODEL_LOCK if heavy else nullcontext()
         with guard:
+            effective_timeout = timeout or self.config.whisper_timeout_seconds
             for native_attempt in range(2):
                 try:
                     completed = subprocess.run(
@@ -225,12 +264,12 @@ class LocalWhisperPipeline:
                         env=self.config.runtime_environment(),
                         capture_output=True,
                         text=True,
-                        timeout=timeout or self.config.whisper_timeout_seconds,
+                        timeout=effective_timeout,
                     )
                 except subprocess.TimeoutExpired as exc:
                     self._append_stderr(stderr_path, label, str(exc))
                     raise RuntimeError(
-                        f"{label} exceeded the {self.config.whisper_timeout_seconds}-second timeout"
+                        f"{label} exceeded the {effective_timeout:.0f}-second timeout"
                     ) from exc
                 self._append_stderr(stderr_path, label, completed.stderr)
                 if not completed.returncode:
@@ -283,6 +322,7 @@ class LocalWhisperPipeline:
         metadata_path = work_directory / "audio.json"
         raw_transcript_path = work_directory / "raw-turbo.json"
         agc_transcript_path = work_directory / "agc-turbo.json"
+        fallback_transcript_path = work_directory / "fallback-vad.json"
         whisper_prompt = self._whisper_prompt()
 
         self._event(
@@ -346,7 +386,7 @@ class LocalWhisperPipeline:
             log_path,
             "whisper",
             "active",
-            "اجرای پاس دوم Whisper روی صدای تقویت‌شده",
+            "انتخاب تطبیقی نسخهٔ صوت برای فرضیهٔ Turbo",
         )
         use_enhanced = (self.config.audio_enhancement == "adaptive"
                         and metadata.get("enhancement_recommended")
@@ -363,13 +403,63 @@ class LocalWhisperPipeline:
         self._event(
             log_path,
             "whisper",
-            "completed",
-            "دو پاس Whisper کامل شد؛ بررسی اختلاف‌ها و بخش‌های مشکوک",
+            "active",
+            "اجرای large-v3 روی پنجره‌های دقیق گفتار",
         )
-        evidence = build_evidence(raw_result, enhanced_result if use_enhanced else {"segments": []},
-                                  float(metadata.get("duration_seconds", 0)),
-                                  raw_result.get("speech_regions"))
-        deadline = time.monotonic() + self.config.whisper_retry_seconds
+        duration = float(metadata.get("duration_seconds", 0))
+        speech_regions = raw_result.get("speech_regions") or []
+        vad_windows = tight_vad_windows(
+            speech_regions, duration, maximum_seconds=self.config.recovery_max_seconds)
+        fallback_result = None
+        fallback_error = None
+        if (vad_windows and not metadata.get("independent_conversation_channels")
+                and parse_spec(self.config.asr_fallback).provider != "qwen3-asr"):
+            windows_path = work_directory / "fallback-vad-windows.json"
+            windows_path.write_text(json.dumps(vad_windows, ensure_ascii=False, indent=2) + "\n",
+                                    encoding="utf-8")
+            command = self._asr_command(raw_wav, self.config.asr_fallback, "")
+            command.extend(["--windows-file", str(windows_path)])
+            try:
+                fallback_result = self._run_json(
+                    command, fallback_transcript_path, stderr_path,
+                    "fallback ASR tight VAD pass",
+                )
+            except RuntimeError as exc:
+                fallback_error = str(exc)
+                self._event(log_path, "whisper", "warning",
+                            "پاس large-v3 کامل نشد؛ مسیر بازیابی محدود ادامه دارد")
+
+        turbo_candidates = [("raw", raw_result)]
+        if use_enhanced:
+            turbo_candidates.append(("agc", enhanced_result))
+        turbo_variant, turbo_result = choose_candidate(turbo_candidates)
+        turbo_path = agc_transcript_path if turbo_variant == "agc" else raw_transcript_path
+        fallback_has_usable_segment = bool(fallback_result and any(
+            not segment_is_quarantined(row, duration)
+            for row in fallback_result.get("segments", [])
+        ))
+        if fallback_has_usable_segment:
+            evidence_primary = fallback_result
+            evidence_alternative = turbo_result
+            prepared_primary_path = fallback_transcript_path
+            prepared_alternative_path = turbo_path
+            primary_mode = "large_v3_tight_vad"
+        else:
+            evidence_primary = turbo_result
+            evidence_alternative = (enhanced_result if use_enhanced and turbo_variant == "raw"
+                                    else raw_result if use_enhanced else {"segments": []})
+            prepared_primary_path = turbo_path
+            prepared_alternative_path = (agc_transcript_path if turbo_variant == "raw"
+                                         else raw_transcript_path)
+            primary_mode = f"turbo_{turbo_variant}"
+        self._event(
+            log_path,
+            "whisper",
+            "completed",
+            "فرضیه‌های ASR آماده شد؛ بررسی اختلاف‌ها و بخش‌های مشکوک",
+        )
+        evidence = build_evidence(evidence_primary, evidence_alternative, duration, speech_regions)
+        coverage_deadline = time.monotonic() + self.config.whisper_retry_seconds
         retry_variants = [("raw", raw_wav)]
         if use_enhanced:
             retry_variants.append(("agc", agc_wav))
@@ -386,6 +476,10 @@ class LocalWhisperPipeline:
             "audio_variant": "window_quality_selection",
             "cascade": [self.config.asr_primary, self.config.asr_fallback] +
                        ([self.config.asr_alternative] if self.config.asr_alternative else []),
+            "attempts": [],
+            "coverage_budget_seconds": self.config.whisper_retry_seconds,
+            "selective_retry_budget_seconds": self.config.whisper_retry_seconds,
+            "selective_retry_attempts": [],
         }
         if coverage_plans:
             self._event(
@@ -395,10 +489,6 @@ class LocalWhisperPipeline:
                 f"بازیابی {len(coverage_plans)} پنجرهٔ گفتاری فاقد متن با زمینهٔ کامل",
             )
         for index, plan in enumerate(coverage_plans):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._event(log_path, "whisper_coverage", "warning", "مهلت بازیابی پوشش گفتار پایان یافت")
-                break
             self._event(
                 log_path,
                 "whisper_coverage",
@@ -407,39 +497,47 @@ class LocalWhisperPipeline:
             )
             recovered = 0
             specs = coverage_summary["cascade"]
-            for cascade_index, spec in enumerate(specs):
-                window = dict(plan)
-                if cascade_index and recovered == 0:
-                    center = (plan["gap_start"] + plan["gap_end"]) / 2
-                    width = min(float(evidence["duration_seconds"]), float(self.config.recovery_expand_seconds))
-                    window["start"] = max(0.0, min(float(evidence["duration_seconds"]) - width, center - width / 2))
-                    window["end"] = window["start"] + width
-                candidates = []
-                for variant, retry_wav in retry_variants:
-                    try:
-                        retry = self._run_json(
-                            self._asr_command(retry_wav, spec, whisper_prompt,
-                                              window["start"], window["end"]),
-                            work_directory / f"coverage-{index + 1}-{cascade_index}-{variant}.json",
-                            stderr_path, f"ASR coverage recovery {spec} {variant}", timeout=remaining)
-                        if spec.startswith("qwen3-asr:") and retry.get("status") == "completed":
-                            retry = self._align_qwen_result(
-                                retry, retry_wav, work_directory, stderr_path,
-                                f"coverage-{index + 1}-{cascade_index}-{variant}",
-                            ) or {"status": "unsupported", "error": "ctc_alignment_coverage_below_80pct"}
-                        if retry.get("status") not in {"unsupported", "failed"}:
-                            candidates.append((variant, retry))
-                        else:
-                            coverage_summary.setdefault("unsupported", []).append({"provider": spec,
-                                                                                   "status": retry.get("status"),
-                                                                                   "error": retry.get("error")})
-                    except RuntimeError as exc:
-                        coverage_summary.setdefault("errors", []).append(str(exc))
-                if candidates:
-                    variant, retry = choose_candidate(candidates)
-                    retry.setdefault("provenance", {})["selected_audio_variant"] = variant
-                    recovered = attach_coverage_retry(evidence, retry, plan["segment_ids"])
-                if recovered:
+            attempts = coverage_attempt_windows(
+                plan, float(evidence["duration_seconds"]), self.config.recovery_expand_seconds)
+            for attempt_index, window in enumerate(attempts):
+                for cascade_index, spec in enumerate(specs):
+                    remaining = coverage_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    candidates = []
+                    for variant, retry_wav in retry_variants:
+                        try:
+                            retry = self._run_json(
+                                self._asr_command(retry_wav, spec, whisper_prompt,
+                                                  window["start"], window["end"]),
+                                work_directory / f"coverage-{index + 1}-{attempt_index}-{cascade_index}-{variant}.json",
+                                stderr_path, f"ASR coverage recovery {spec} {variant}",
+                                timeout=remaining)
+                            coverage_summary["attempts"].append({
+                                "plan": index + 1, "window_mode": window["mode"],
+                                "start": window["start"], "end": window["end"],
+                                "provider": spec, "audio_variant": variant,
+                            })
+                            if spec.startswith("qwen3-asr:") and retry.get("status") == "completed":
+                                retry = self._align_qwen_result(
+                                    retry, retry_wav, work_directory, stderr_path,
+                                    f"coverage-{index + 1}-{attempt_index}-{cascade_index}-{variant}",
+                                ) or {"status": "unsupported", "error": "ctc_alignment_coverage_below_80pct"}
+                            if retry.get("status") not in {"unsupported", "failed"}:
+                                candidates.append((variant, retry))
+                            else:
+                                coverage_summary.setdefault("unsupported", []).append({
+                                    "provider": spec, "status": retry.get("status"),
+                                    "error": retry.get("error")})
+                        except RuntimeError as exc:
+                            coverage_summary.setdefault("errors", []).append(str(exc))
+                    if candidates:
+                        variant, retry = choose_candidate(candidates)
+                        retry.setdefault("provenance", {})["selected_audio_variant"] = variant
+                        recovered = attach_coverage_retry(evidence, retry, plan["segment_ids"])
+                    if recovered:
+                        break
+                if recovered or coverage_deadline - time.monotonic() <= 0:
                     break
             coverage_summary["completed_windows"] += 1
             coverage_summary["recovered_segments"] += recovered
@@ -460,8 +558,12 @@ class LocalWhisperPipeline:
             "repetition", "compression", "pass_disagreement", "speech_gap", "low_logprob",
             "invalid_asr_metrics", "decoder_truncated"} and usable_retry_text(row) is None]
         candidates.sort(key=retry_priority)
+        # Coverage recovery and selective repair solve different failures. A
+        # call with several silent/failed windows must not consume the entire
+        # budget before a compact, high-priority decoder loop can be repaired.
+        selective_deadline = time.monotonic() + self.config.whisper_retry_seconds
         for index, row in enumerate(candidates[:self.config.whisper_retry_segments]):
-            remaining = deadline - time.monotonic()
+            remaining = selective_deadline - time.monotonic()
             if remaining <= 0:
                 break
             self._event(log_path, "whisper_retry", "active", f"بازخوانی محدود بخش مشکوک {index + 1}: {row['start']:.1f} تا {row['end']:.1f} ثانیه")
@@ -473,6 +575,11 @@ class LocalWhisperPipeline:
                     work_directory / f"retry-{row['id']}.json", stderr_path,
                     "fallback ASR selective retry", timeout=remaining)
                 row["retry"] = retry
+                coverage_summary["selective_retry_attempts"].append({
+                    "segment_id": row["id"], "start": max(0, row["start"] - 2),
+                    "end": min(evidence["duration_seconds"], row["end"] + 2),
+                    "provider": self.config.asr_fallback, "audio_variant": "raw",
+                })
                 if any(set(s.get("flags", [])) & {"invalid_asr_metrics", "decoder_truncated"}
                        for s in retry.get("segments", [])):
                     row["flags"] = sorted(set(row["flags"] + ["invalid_asr_metrics"]))
@@ -480,9 +587,15 @@ class LocalWhisperPipeline:
             except RuntimeError as exc:
                 row["retry_error"] = str(exc)
                 self._event(log_path, "whisper_retry", "warning", "بازخوانی تکمیلی کامل نشد؛ بخش برای بازبینی انسانی علامت‌گذاری شد")
+        lexicon_summary = self._validate_sensitive_terms(
+            evidence, raw_wav, work_directory, stderr_path)
         # Speaker inference runs after text review, in its isolated runtime.
         for row in evidence["segments"]:
             row.update(consensus_for_row(row))
+            guard_unverified_entities(row)
+            if row.get("entity_resolutions"):
+                row["candidate_sources"] = list(dict.fromkeys(
+                    [*row.get("candidate_sources", []), "persian_ctc_lexicon"]))
         evidence["provenance"] = {
             "callforge_version": __version__,
             "pipeline": self.config.transcription_profile,
@@ -493,10 +606,14 @@ class LocalWhisperPipeline:
             "audio_enhancement": self.config.audio_enhancement,
             "heavy_concurrency": self.config.asr_heavy_concurrency,
             "cascade": coverage_summary,
+            "lexicon": lexicon_summary,
+            "primary_mode": primary_mode,
+            "tight_vad_windows": vad_windows,
+            "fallback_error": fallback_error,
         }
         write_json(work_directory / "evidence.json", evidence)
         return PreparedTranscription(
             metadata_path=metadata_path,
-            raw_transcript_path=raw_transcript_path,
-            agc_transcript_path=agc_transcript_path,
+            raw_transcript_path=prepared_primary_path,
+            agc_transcript_path=prepared_alternative_path,
         )

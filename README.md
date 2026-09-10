@@ -170,7 +170,7 @@ lease_seconds = 7200
 whisper_timeout_seconds = 1800
 codex_timeout_seconds = 600
 codex_idle_timeout_seconds = 120
-codex_reasoning_effort = "low"
+codex_reasoning_effort = "medium"
 codex_model = ""
 codex_ignore_user_config = true
 codex_ignore_rules = true
@@ -196,7 +196,23 @@ diarization = true
 diarization_timeout_seconds = 180
 alignment_timeout_seconds = 180
 role_timeout_seconds = 180
+
+[[callforge.terms]]
+canonical = "ونسی"
+type = "brand"
+aliases = ["وینسی", "اینسی", "ون سی"]
+
+[[callforge.terms]]
+canonical = "فاضلی"
+type = "support_name"
+aliases = ["آجلی", "آزلی", "آزلیه"]
+contexts = ["هستم", "از ونسی تماس"]
+min_alignment_score = 0.10
+min_alignment_margin = 0.08
+min_character_hits = 0.60
 ```
+
+`terms` شکل ساخت‌یافتهٔ glossary است. نوع‌های `brand`، `product` و `organization` فقط aliasی را که واقعاً در خروجی ASR آمده به املای canonical تبدیل می‌کنند و هیچ واژه‌ای از خود اضافه نمی‌کنند. نوع‌های `person` و `support_name` حساس‌اند: مشاهدهٔ alias فقط یک candidate می‌سازد و نام پس از forced-alignment محلی با مدل CTC فارسی و عبور از حد امتیاز و فاصله با گزینهٔ دوم پذیرفته می‌شود. در صورت نبود runtime، امتیاز ناکافی یا رقابت نزدیک، همان span نامفهوم می‌ماند. فهرست سادهٔ `glossary` برای سازگاری قبلی همچنان خوانده می‌شود.
 
 ## مدل داده
 
@@ -204,13 +220,13 @@ role_timeout_seconds = 180
 audio_files 1 ─── * jobs 1 ─── * processing_runs
      │                            │
      └──── 1 ─── * transcripts ──┘
-     │                    │
-     └──── 1 ─── * artifacts ────┘
+     ├──── 1 ─── * artifacts ────┘
+     └──── 1 ─── * review_corrections
 ```
 
 `transcripts.content` متن کامل Markdown را نگه می‌دارد و `markdown_path` مسیر نسخهٔ کنار فایل را ثبت می‌کند. هر ویرایش جدید یک نسخهٔ تازه می‌سازد و فقط یکی `is_current=1` است. در نتیجه فایل کناری خروجی قابل‌خواندن برای انسان است، ولی دیتابیس منبع ساخت‌یافتهٔ مرحله‌های بعدی باقی می‌ماند.
 
-ارتقا به schema نسخهٔ ۵ خودکار و افزایشی است. قبل از تغییر دیتابیس موجود، snapshot سازگار SQLite در `.callforge/backups` ساخته می‌شود. reset دیتابیس، MP3/Markdown، لاگ‌ها و فایل‌های backup را پاک نمی‌کند.
+ارتقا به schema نسخهٔ ۶ خودکار و افزایشی است. قبل از تغییر دیتابیس موجود، snapshot سازگار SQLite در `.callforge/backups` ساخته می‌شود. reset دیتابیس، MP3/Markdown، لاگ‌ها و فایل‌های backup را پاک نمی‌کند.
 
 ## رفتار پردازش
 
@@ -232,7 +248,7 @@ callforge benchmark-asr --reference /absolute/path/dev.json \
 
 `benchmark-asr` کاملاً offline است و در runtime دانلود نمی‌کند. ۳۰ مرجع development برای انتخاب و ۱۰ holdout فقط برای candidate برنده استفاده می‌شوند. متن مرجع فقط وارد scorer می‌شود، نه prompt یا inference. هر candidate حداقل سه اجرای seedدار دارد و source audio، Markdown، reference و دیتابیس immutable می‌مانند. Qwen با runtime جداگانهٔ Python 3.12 اجرا و فقط با پوشش CTC فارسی حداقل ۸۰٪ پذیرفته می‌شود؛ نبود backend، OOM یا crash همان candidate را `unsupported` می‌کند.
 
-هر worker صوت را محلی decode می‌کند و کانال‌ها را حفظ می‌کند. کانال‌های مستقل جداگانه transcribe و زمانی merge می‌شوند؛ در غیر این صورت downmix مرجع است. raw همیشه مرجع اصلی می‌ماند و AGC تنها برای صوت کم‌حجم ساخته/استفاده می‌شود. prompt پیش‌فرض خاموش است؛ glossary فقط راهنمای normalization املاست و منبع entity نیست. variant حذف نویز فقط در benchmark قابل آزمایش است.
+هر worker صوت را محلی decode می‌کند و کانال‌ها را حفظ می‌کند. کانال‌های مستقل جداگانه transcribe و زمانی merge می‌شوند؛ در غیر این صورت downmix مرجع است. raw همیشه مرجع اصلی می‌ماند و AGC تنها برای صوت کم‌حجم ساخته/استفاده می‌شود. prompt پیش‌فرض خاموش است؛ glossary فقط راهنمای normalization املاست و منبع entity نیست. alias برند باید در hypothesis حاضر باشد و نام شخص باید علاوه بر حضور candidate، تأیید صوتی CTC داشته باشد. تمام تصمیم‌ها و امتیازهای lexicon در run evidence ثبت می‌شوند. variant حذف نویز فقط در benchmark قابل آزمایش است.
 
 بازیابی روی پنجرهٔ VAD-aligned بین ۸ تا ۱۵ ثانیه با دو ثانیه context آغاز می‌شود و در شکست یک بار تا ۳۰ ثانیه گسترش می‌یابد. cascade به‌ترتیب Turbo بدون Q4، full large-v3 و candidate جایگزینِ promote‌شده است. raw/AGC با repetition، compression، logprob، timestamp و prompt leakage همان window انتخاب می‌شود. segment خراب پیش از word allocation قرنطینه می‌شود؛ zero-duration loop فقط یک failed-decode unit می‌سازد و timeline تکراری منتشر نمی‌شود.
 
@@ -290,6 +306,8 @@ CTC فقط زمان کلماتِ متن ماشینی را تخمین می‌زن
 روی Apple Silicon، گزینهٔ `benchmark-alignment --backend mlx ...` فقط از Whisper turbo موجود در cache استفاده می‌کند و دانلود را ممنوع می‌کند. این روش متن ثابت را با attention/DTW هم‌تراز می‌کند؛ متن تازه decode نمی‌شود و هیچ کلمه‌ای جایگزین نمی‌شود. بخش دارای عدد یا `[نامفهوم]` در این روش رد می‌شود. این شاهد مستقل از Whisper نیست و با CTC اشتباه گرفته نمی‌شود؛ روش و revision در گزارش ثبت می‌شوند. استفاده از CTC پیش‌فرض است؛ جایگزینی روش هرگز خودکار و پنهانی نیست.
 
 در UI یک تماس دارای متن را باز کنید. «کارگاه بازبینی انسانی» امکان پخش هر بخش با سرعت دلخواه، مقایسهٔ متن خام/تقویت‌شده/بازخوانی تکمیلی، اصلاح زمان و گوینده و متن، افزودن یا حذف بخش و ثبت یادداشت را فراهم می‌کند. متن‌های قدیمی بدون زمان‌بندی هم ویرایشگر Markdown دارند؛ برای آن‌ها زمان جعلی ساخته نمی‌شود. وضعیت‌های `needs_review`، `in_review` و `approved` مستقل از وضعیت پردازش‌اند و فیلتر جدا دارند.
+
+منوی «بازبینی» همهٔ بخش‌های نامفهوم transcriptهای جاری را در یک صف جمع می‌کند. هر مورد با زمان دقیق همان بازهٔ صوتی، متن قبل و بعد و پیشنهادهای معتبرِ خروجی خام، تقویت‌شده، retry و consensus نمایش داده می‌شود. بازبین می‌تواند یک پیشنهاد را انتخاب کند یا متن کامل بخش را دستی وارد کند. ثبت اصلاح در یک transaction هم نسخهٔ تازهٔ transcript را می‌سازد و هم نمونه‌ای مستقل شامل متن اولیه، متن صحیح، پیشنهادها و evidence را در `review_corrections` نگه می‌دارد تا بعداً برای استخراج کنترل‌شدهٔ glossary استفاده شود. این داده خودکار وارد glossary یا inference نمی‌شود.
 
 «ذخیرهٔ اصلاحات» یک نسخهٔ جدید با نام بازبین می‌سازد؛ «ثبت تأیید انسانی» مخصوص نسخه‌ای است که واقعاً شنیده و بررسی شده. نام بازبین در این ابزار localhost خوداظهاری است و احراز هویت محسوب نمی‌شود. تاریخچهٔ نسخه‌ها حفظ می‌شود. ویرایش مبتنی بر نسخهٔ قدیمی رد می‌شود. Markdown همگام می‌شود؛ اگر دیسک خطا بدهد یا فایل بیرون برنامه تغییر کرده باشد، اصلاح در دیتابیس باقی می‌ماند و فایل بیرونی بازنویسی نمی‌شود. پس از رفع مشکل و بازخوانی نسخه می‌توان همگام‌سازی را دوباره اجرا کرد.
 

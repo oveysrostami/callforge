@@ -15,6 +15,11 @@ const state = {
   reviewRows: [],
   reviewBase: null,
   reviewAudioId: null,
+  queueOffset: 0,
+  queueLimit: 20,
+  queueTotal: 0,
+  queueItems: [],
+  queueSaving: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -242,6 +247,202 @@ async function loadStats() {
   $("stat-transcripts").textContent = faNumber(stats.current_transcripts || 0);
   $("stat-pending").textContent = faNumber(stats.pending || 0);
   $("stat-failed").textContent = faNumber(stats.failed || 0);
+}
+
+let queuePlaybackEnd = null;
+
+function switchView(name) {
+  const reviewing = name === "review";
+  $("calls-view").classList.toggle("hidden", reviewing);
+  $("review-queue-view").classList.toggle("hidden", !reviewing);
+  $("nav-calls").classList.toggle("active", !reviewing);
+  $("nav-review").classList.toggle("active", reviewing);
+  if (reviewing) loadReviewQueue().catch((error) => showToast(error.message));
+  else {
+    const player = $("review-queue-player");
+    player.pause();
+    queuePlaybackEnd = null;
+  }
+}
+
+function playQueueSegment(item) {
+  const player = $("review-queue-player");
+  const begin = () => {
+    player.currentTime = Math.max(0, Number(item.start) - 0.35);
+    queuePlaybackEnd = Number(item.end) + 0.35;
+    player.play().catch((error) => showToast(error.message));
+  };
+  $("queue-player-title").textContent = item.filename;
+  $("queue-player-time").textContent = `${duration(item.start)} تا ${duration(item.end)} · ${item.speaker}`;
+  if (player.dataset.audioId !== String(item.audio_id)) {
+    player.pause();
+    player.dataset.audioId = String(item.audio_id);
+    player.src = item.audio_url;
+    player.load();
+    player.addEventListener("loadedmetadata", begin, { once: true });
+  } else begin();
+}
+
+function contextLine(label, text) {
+  const paragraph = document.createElement("p");
+  paragraph.className = "queue-context-line";
+  const strong = document.createElement("strong");
+  strong.textContent = `${label}: `;
+  paragraph.append(strong, document.createTextNode(text || "—"));
+  return paragraph;
+}
+
+function renderReviewQueue() {
+  const container = $("review-queue-list");
+  container.replaceChildren();
+  $("review-queue-empty").classList.toggle("hidden", state.queueItems.length > 0);
+  state.queueItems.forEach((item, index) => {
+    const card = document.createElement("article");
+    card.className = "queue-item";
+    card.dataset.key = item.key;
+
+    const heading = document.createElement("header");
+    const titleWrap = document.createElement("div");
+    const title = document.createElement("button");
+    title.type = "button";
+    title.className = "queue-file-link";
+    title.textContent = item.filename;
+    title.addEventListener("click", async () => {
+      switchView("calls");
+      await selectFile(item.audio_id);
+    });
+    const meta = document.createElement("span");
+    meta.textContent = `نسخه ${faNumber(item.transcript_version)} · ${item.speaker}`;
+    titleWrap.append(title, meta);
+    const play = document.createElement("button");
+    play.type = "button";
+    play.className = "queue-play";
+    play.textContent = `▶ پخش ${duration(item.start)} تا ${duration(item.end)}`;
+    play.addEventListener("click", () => playQueueSegment(item));
+    heading.append(titleWrap, play);
+    card.append(heading);
+
+    const context = document.createElement("div");
+    context.className = "queue-context";
+    if (item.context_before) context.append(contextLine("قبل", item.context_before));
+    context.append(contextLine("بخش فعلی", item.text));
+    if (item.context_after) context.append(contextLine("بعد", item.context_after));
+    card.append(context);
+
+    const options = document.createElement("fieldset");
+    const legend = document.createElement("legend");
+    legend.textContent = item.candidates.length ? "پیشنهادهای مدل" : "مدل پیشنهاد قابل اتکایی ثبت نکرده است";
+    options.append(legend);
+    const radioName = `queue-choice-${index}`;
+    for (const candidate of item.candidates) {
+      const label = document.createElement("label");
+      label.className = "queue-option";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = radioName;
+      radio.value = candidate.id;
+      radio.dataset.selectionSource = "candidate";
+      const value = document.createElement("span");
+      const source = document.createElement("small");
+      value.textContent = candidate.text;
+      source.textContent = candidate.source_label;
+      label.append(radio, value, source);
+      options.append(label);
+    }
+    const customLabel = document.createElement("label");
+    customLabel.className = "queue-option queue-custom-option";
+    const customRadio = document.createElement("input");
+    customRadio.type = "radio";
+    customRadio.name = radioName;
+    customRadio.value = "custom";
+    customRadio.dataset.selectionSource = "custom";
+    const customTitle = document.createElement("span");
+    customTitle.textContent = "متن را خودم وارد می‌کنم";
+    customLabel.append(customRadio, customTitle);
+    options.append(customLabel);
+    const custom = document.createElement("textarea");
+    custom.className = "queue-custom-text";
+    custom.rows = 3;
+    custom.maxLength = 20000;
+    custom.placeholder = "متن کامل و صحیح این بخش را بنویسید…";
+    custom.addEventListener("focus", () => { customRadio.checked = true; });
+    custom.addEventListener("input", () => { customRadio.checked = true; });
+    options.append(custom);
+    card.append(options);
+
+    if (item.notes) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "یادداشت مدل";
+      const note = document.createElement("p");
+      note.textContent = item.notes;
+      details.append(summary, note);
+      card.append(details);
+    }
+    const footer = document.createElement("footer");
+    const message = document.createElement("span");
+    message.className = "queue-item-message";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "queue-save";
+    save.textContent = "ثبت اصلاح";
+    save.addEventListener("click", () => saveQueueCorrection(item, card));
+    footer.append(message, save);
+    card.append(footer);
+    container.append(card);
+  });
+}
+
+async function loadReviewQueue() {
+  const payload = await api(`/api/review?limit=${state.queueLimit}&offset=${state.queueOffset}`);
+  state.queueTotal = payload.total;
+  state.queueItems = payload.items;
+  if (!payload.items.length && state.queueOffset > 0) {
+    state.queueOffset = Math.max(0, state.queueOffset - state.queueLimit);
+    return loadReviewQueue();
+  }
+  $("review-nav-count").textContent = faNumber(payload.total);
+  const page = Math.floor(state.queueOffset / state.queueLimit) + 1;
+  const pages = Math.max(1, Math.ceil(payload.total / state.queueLimit));
+  $("queue-page-label").textContent = `صفحه ${faNumber(page)} از ${faNumber(pages)} · ${faNumber(payload.total)} مورد`;
+  $("queue-prev").disabled = state.queueOffset === 0;
+  $("queue-next").disabled = state.queueOffset + state.queueLimit >= payload.total;
+  renderReviewQueue();
+}
+
+async function saveQueueCorrection(item, card) {
+  if (state.queueSaving) return;
+  const reviewer = $("queue-reviewer").value.trim();
+  const selected = card.querySelector('input[type="radio"]:checked');
+  const message = card.querySelector(".queue-item-message");
+  if (!reviewer) { message.textContent = "نام بازبین را وارد کنید."; $("queue-reviewer").focus(); return; }
+  if (!selected) { message.textContent = "یک پیشنهاد یا ورودی دستی را انتخاب کنید."; return; }
+  const selectionSource = selected.dataset.selectionSource;
+  const customText = card.querySelector(".queue-custom-text").value.trim();
+  if (selectionSource === "custom" && !customText) { message.textContent = "متن صحیح را وارد کنید."; return; }
+  const payload = {
+    audio_id: item.audio_id,
+    base_transcript_id: item.transcript_id,
+    segment_id: item.segment_id,
+    reviewer,
+    selection_source: selectionSource,
+  };
+  if (selectionSource === "candidate") payload.candidate_id = selected.value;
+  else payload.custom_text = customText;
+  state.queueSaving = true;
+  card.querySelectorAll("button,input,textarea").forEach((element) => { element.disabled = true; });
+  message.textContent = "در حال ثبت نسخهٔ جدید…";
+  try {
+    await post("/api/review/corrections", payload);
+    localStorage.setItem("callforge-reviewer", reviewer);
+    $("queue-message").textContent = "اصلاح در transcript و مجموعهٔ دادهٔ glossary ذخیره شد.";
+    await Promise.all([loadReviewQueue(), loadStats(), loadFiles()]);
+  } catch (error) {
+    message.textContent = error.message;
+    card.querySelectorAll("button,input,textarea").forEach((element) => { element.disabled = false; });
+  } finally {
+    state.queueSaving = false;
+  }
 }
 
 function queryString() {
@@ -724,8 +925,26 @@ $("search").addEventListener("input", () => {
 $("next-page").addEventListener("click", () => { state.offset += state.limit; loadFiles(); });
 $("prev-page").addEventListener("click", () => { state.offset = Math.max(0, state.offset - state.limit); loadFiles(); });
 $("transcribe-button").addEventListener("click", transcribeSelected);
+$("nav-calls").addEventListener("click", () => switchView("calls"));
+$("nav-review").addEventListener("click", () => switchView("review"));
+$("queue-prev").addEventListener("click", () => {
+  state.queueOffset = Math.max(0, state.queueOffset - state.queueLimit);
+  loadReviewQueue().catch((error) => showToast(error.message));
+});
+$("queue-next").addEventListener("click", () => {
+  state.queueOffset += state.queueLimit;
+  loadReviewQueue().catch((error) => showToast(error.message));
+});
+$("queue-reviewer").value = localStorage.getItem("callforge-reviewer") || "";
+$("review-queue-player").addEventListener("timeupdate", () => {
+  const player = $("review-queue-player");
+  if (queuePlaybackEnd !== null && player.currentTime >= queuePlaybackEnd) {
+    player.pause();
+    queuePlaybackEnd = null;
+  }
+});
 
-Promise.all([loadStats(), loadFiles()]).catch((error) => {
+Promise.all([loadStats(), loadFiles(), loadReviewQueue()]).catch((error) => {
   $("connection").classList.add("offline");
   showToast(error.message);
 });
@@ -733,6 +952,7 @@ Promise.all([loadStats(), loadFiles()]).catch((error) => {
 window.setInterval(() => {
   loadStats().catch(() => {});
   loadFiles().catch(() => {});
+  if (!state.queueSaving) loadReviewQueue().catch(() => {});
   if (state.selectedId && (state.selectedItem?.job_status === "running" || isInteractivelyQueued(state.selectedItem || {}))) {
     selectFile(state.selectedId, false).catch(() => {});
   }

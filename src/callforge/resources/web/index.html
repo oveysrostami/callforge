@@ -14,10 +14,17 @@
         <p class="eyebrow">آرشیو تماس‌ها</p>
         <h1>CallForge</h1>
       </div>
-      <div class="connection" id="connection"><span></span> متصل به دیتابیس محلی</div>
+      <div class="topbar-actions">
+        <nav class="main-nav" aria-label="منوی اصلی">
+          <button id="nav-calls" class="active" type="button">تماس‌ها</button>
+          <button id="nav-review" type="button">بازبینی <span id="review-nav-count">—</span></button>
+        </nav>
+        <div class="connection" id="connection"><span></span> متصل به دیتابیس محلی</div>
+      </div>
     </header>
 
     <main>
+      <section id="calls-view">
       <section class="stats" aria-label="خلاصه وضعیت">
         <article><span>قابل پردازش</span><strong id="stat-files">—</strong></article>
         <article><span>متن آماده</span><strong id="stat-transcripts">—</strong></article>
@@ -185,6 +192,39 @@
             </section>
           </div>
         </aside>
+      </section>
+      </section>
+
+      <section class="review-queue-view hidden" id="review-queue-view" aria-labelledby="review-queue-heading">
+        <header class="review-queue-heading">
+          <div>
+            <p class="eyebrow">بازبینی انسانی مبتنی بر صوت</p>
+            <h2 id="review-queue-heading">بخش‌های نامفهوم</h2>
+            <p>صوت همان بازه را گوش کنید، یکی از پیشنهادهای مدل را انتخاب کنید یا متن کامل و صحیح بخش را بنویسید.</p>
+          </div>
+          <label>نام بازبین
+            <input id="queue-reviewer" maxlength="200" autocomplete="name" placeholder="نام شما">
+          </label>
+        </header>
+        <div class="queue-player-card">
+          <div>
+            <strong id="queue-player-title">یک بخش را برای پخش انتخاب کنید</strong>
+            <span id="queue-player-time">—</span>
+          </div>
+          <audio id="review-queue-player" controls preload="metadata"></audio>
+        </div>
+        <p class="queue-message" id="queue-message" role="status" aria-live="polite"></p>
+        <div class="review-queue-list" id="review-queue-list"></div>
+        <div class="empty hidden" id="review-queue-empty">
+          <div>✓</div>
+          <strong>بخش نامفهومی باقی نمانده است</strong>
+          <span>با transcriptهای جدید، موارد تازه خودکار به این صف اضافه می‌شوند.</span>
+        </div>
+        <nav class="pagination" aria-label="صفحه‌بندی بازبینی">
+          <button id="queue-next" type="button">صفحه بعد</button>
+          <span id="queue-page-label">—</span>
+          <button id="queue-prev" type="button">صفحه قبل</button>
+        </nav>
       </section>
     </main>
 
